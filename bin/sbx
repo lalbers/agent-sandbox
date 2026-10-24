@@ -1,0 +1,755 @@
+#!/bin/bash
+# sbx — host CLI for the claude-sbx sandbox: an isolated Claude Code
+# (setup-token, no claude.ai connectors) with REA, in rootless Podman behind an
+# egress proxy. `sbx help` lists the commands; README.md explains the model.
+set -euo pipefail
+
+SBX_ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+
+CTR=claude-sbx
+EGRESS=sbx-egress
+NET_INT=sbx-int                 # --internal, no DNS: the sandbox's only network
+NET_EXT=sbx-ext                 # normal network, only the proxy is attached
+SUBNET=10.213.77.0/24           # also hard-coded in egress/common.conf
+GATEWAY=10.213.77.1
+EGRESS_IP=10.213.77.2
+SBX_IP=10.213.77.10
+PROXY_URL=http://$EGRESS_IP:3128
+SECRET=claude-sbx-oauth
+TMUX_SESSION=claude
+
+IMG_BASE=localhost/claude-sbx-base:latest
+IMG_REA=localhost/claude-sbx-rea:latest
+IMG_EGRESS=localhost/claude-sbx-egress:latest
+IMAGE=${SBX_IMAGE:-$IMG_REA}
+MEMORY=${SBX_MEMORY:-8g}
+CPUS=${SBX_CPUS:-4}
+
+# Host directories below which paths may be bind-mounted (and therefore
+# SELinux-relabelled). Anything else can only be copied into lab/in.
+MOUNT_ROOTS=${SBX_MOUNT_ROOTS:-$HOME/Git:$HOME/Downloads}
+
+STATE_HOME=$SBX_ROOT/state/home
+LAST_UP=$SBX_ROOT/state/last-up
+UP_STAMP=$SBX_ROOT/state/up-stamp
+SECCOMP=$SBX_ROOT/state/seccomp.json
+SECCOMP_DEFAULT=/usr/share/containers/seccomp.json
+LAB_IN=$SBX_ROOT/lab/in
+LAB_OUT=$SBX_ROOT/lab/out
+RUNS=$SBX_ROOT/runs
+LOGS=$SBX_ROOT/logs
+
+usage() {
+    cat <<'EOF'
+sbx — isolated Claude Code + REA in rootless Podman
+
+Setup
+  sbx build [base|rea|egress|all] [--no-cache] [--pull]
+  sbx token set|status|rm        store the token from "claude setup-token" as podman secret
+
+Lifecycle
+  sbx up [--net api|open|none] [--mount PATH[:ro|:rw]]... [--copy PATH]... [--replace]
+  sbx restart                    recreate with the last --net/--mount options (e.g. after token set)
+  sbx down                       stop and remove (the proxy log is saved to logs/)
+  sbx status
+  sbx reset [--yes]              wipe the sandbox home (Claude sessions, caches)
+
+Files
+  sbx in PATH...                 copy into /lab/in (read-only inside the sandbox)
+  sbx check PATH[:ro|:rw]...     dry-run the mount policy
+  sbx cat FILE                   print a result, read inside the sandbox (safe while it runs)
+  Results: lab/out (= /lab/out), checked and defused by `sbx down`. Transcripts: runs/.
+
+Driving Claude
+  sbx ask [--resume ID|--continue] [--model M] [--cwd DIR] [--raw] PROMPT | -
+  sbx tui [CLAUDE-ARGS]          interactive Claude in tmux inside the sandbox
+  sbx attach                     attach your terminal (detach: Ctrl-b d)
+  sbx screen [LINES]             print the tmux screen plus LINES of history
+  sbx keys [--enter] TEXT        type into the tmux session
+  sbx keys --key KEY...          send keys (Enter, Escape, C-c, ...)
+
+Inspection
+  sbx sh [-- CMD...]             shell or command inside the sandbox
+  sbx egress [-f] [--all]        proxy log: every destination the sandbox asked for
+  sbx selftest                   isolation checks inside the running sandbox
+
+Networks: api = Anthropic API only (default), open = internet but never LAN or
+host, none = no network (Claude cannot run, `sbx sh` still works).
+Mounts are read-only unless :rw, appear under /host/<path>, and are limited to
+SBX_MOUNT_ROOTS (default ~/Git:~/Downloads). Existing .git dirs in rw mounts
+stay ro; new .git/.envrc/symlinks there are reported by `sbx ask` and `sbx down`.
+Environment: SBX_IMAGE, SBX_MEMORY (8g), SBX_CPUS (4), SBX_MOUNT_ROOTS.
+EOF
+}
+
+die()  { printf 'sbx: %s\n' "$*" >&2; exit 1; }
+note() { printf 'sbx: %s\n' "$*" >&2; }
+need_arg() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"; }
+exists() { podman container exists "$1"; }
+is_running() { [ "$(podman container inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
+require_running() { is_running "$CTR" || die "sandbox is not running (sbx up)"; }
+host_tz() { readlink -f /etc/localtime | sed -n 's|.*/zoneinfo/||p'; }
+
+# Strip control characters (C0 except tab/newline, DEL, C1) from sandbox output
+# before it reaches a terminal: no escape sequences, clipboard writes or line
+# erasing. Malformed UTF-8 becomes U+FFFD instead of aborting the output.
+sanitize() {
+    if command -v perl >/dev/null; then
+        perl -MEncode -pe '$_ = Encode::decode("UTF-8", $_); s/[^\t\n\P{Cc}]//g; $_ = Encode::encode("UTF-8", $_)'
+    else
+        tr -d '\000-\010\013-\037\177'
+    fi
+}
+
+# ---------------------------------------------------------------- path policy
+
+# is_within PATH DIR: PATH is DIR or lies below it.
+is_within() { [ "$1" = "$2" ] || [ "$2" = / ] || [[ $1 == "$2"/* ]]; }
+
+# Print why PATH must never be shared with the sandbox; print nothing if it may.
+deny_reason() {
+    local p=$1 d
+    if is_within "$HOME" "$p"; then echo "contains your whole home directory"; return; fi
+    if [[ $p == "$HOME"/.* ]]; then echo "hidden entry in \$HOME (credentials and configuration)"; return; fi
+    # (personal deny-paths redacted for publication)
+    for d in /proc /sys /dev /run /var/run /boot "$SBX_ROOT"; do
+        d=$(realpath -m -- "$d")
+        if is_within "$p" "$d"; then echo "inside protected path $d"; return; fi
+        if is_within "$d" "$p"; then echo "contains protected path $d"; return; fi
+    done
+}
+
+# Canonical path with symlinks resolved, or die.
+resolve_path() {
+    local p
+    p=$(realpath -e -- "$1" 2>/dev/null) || die "path does not exist: $1"
+    case $p in *[:,]*|*$'\n'*) die "paths containing ':', ',' or a newline are not supported: $p" ;; esac
+    printf '%s\n' "$p"
+}
+
+check_shareable() {
+    local why
+    why=$(deny_reason "$1")
+    [ -z "$why" ] || die "refusing $1: $why"
+}
+
+in_mount_roots() {
+    local root roots=()
+    IFS=: read -ra roots <<< "$MOUNT_ROOTS"
+    for root in "${roots[@]}"; do
+        [ -n "$root" ] || continue
+        if is_within "$1" "$(realpath -m -- "$root")"; then return 0; fi
+    done
+    return 1
+}
+
+# Bind mounts are relabelled (:z). Refuse what relabelling would damage or
+# cannot handle: network/FUSE filesystems, nested mount points, hard links
+# (the label would change for the other link, e.g. a key file, too).
+check_relabel_safe() {
+    local p=$1 fstype mounts t hit
+    fstype=$(stat -f -c %T -- "$p")
+    case $fstype in
+        cifs|smb2|smb3|nfs|nfs4|fuse*|9p|v9fs) die "refusing $p: $fstype cannot be SELinux-relabelled; use --copy" ;;
+    esac
+    mounts=$(findmnt -rn -o TARGET) || die "findmnt failed; cannot check $p for nested mount points"
+    while IFS= read -r t; do
+        t=$(printf '%b' "$t")
+        if [ "$t" != "$p" ] && is_within "$t" "$p"; then die "refusing $p: contains mount point $t; use --copy"; fi
+    done <<< "$mounts"
+    hit=$(find "$p" -xdev -type f -links +1 -print -quit 2>/dev/null || true)
+    [ -z "$hit" ] || die "refusing $p: hard-linked file $hit would be relabelled for all its links; use --copy"
+}
+
+# add_mount PATH[:ro|:rw] — validate a bind mount and append it to MOUNT_ARGS.
+add_mount() {
+    local spec=$1 raw mode p dst g
+    case $spec in
+        *:rw) raw=${spec%:rw}; mode=rw ;;
+        *:ro) raw=${spec%:ro}; mode=ro ;;
+        *)    raw=$spec; mode=ro ;;
+    esac
+    p=$(resolve_path "$raw") || exit 1
+    check_shareable "$p"
+    in_mount_roots "$p" || die "refusing $p: only paths below ${MOUNT_ROOTS//:/, } can be mounted; use --copy"
+    check_relabel_safe "$p"
+    dst=/host$p
+    MOUNT_ARGS+=(-v "$p:$dst:$mode,z,bind")
+    MOUNT_SPECS+=("$p:$mode")
+    note "mount $mode $p -> $dst"
+    if [ "$mode" = rw ]; then
+        # Every existing .git (also nested repos and submodules) stays
+        # read-only, otherwise the agent could plant hooks or config that run
+        # on the host. New .git entries are reported by scan_outputs.
+        while IFS= read -r -d '' g; do
+            [ ! -L "$g" ] || die "refusing $p: $g is a symlink"
+            case $g in *[:,]*|*$'\n'*) die "refusing $p: unsupported character in $g" ;; esac
+            MOUNT_ARGS+=(-v "$g:/host$g:ro,z,bind")
+            note "mount ro $g (git metadata stays read-only)"
+        done < <(find "$p" -xdev -name .git -prune -print0 2>/dev/null)
+    fi
+}
+
+# check_copy PATH — validate a copy source and print its canonical path.
+check_copy() {
+    local src name
+    src=$(resolve_path "$1") || exit 1
+    check_shareable "$src"
+    name=$(basename -- "$src")
+    [ ! -e "$LAB_IN/$name" ] || die "lab/in/$name already exists; remove it there first"
+    printf '%s\n' "$src"
+}
+
+# Copy a host path into lab/in. Copies get the sandbox's label; the original
+# is neither relabelled nor visible to the sandbox.
+copy_in() {
+    local src dst
+    src=$(check_copy "$1") || exit 1
+    dst=$LAB_IN/$(basename -- "$src")
+    mkdir -p "$LAB_IN"
+    cp -R --preserve=mode,timestamps --no-preserve=context -- "$src" "$dst"
+    note "copied $src -> /lab/in/${dst##*/} ($(du -sh -- "$dst" | cut -f1))"
+}
+
+# scan_outputs report|defuse — find what the sandbox left behind that could act
+# on the host. lab/out: symlinks and special files (host tools would follow them
+# to host files), .git and .envrc (a git-aware prompt or direnv runs them on
+# `cd`). rw mounts: new .git/.envrc entries and symlinks, by ctime, which the
+# sandbox cannot backdate. "defuse" (sbx down, container already stopped)
+# removes/renames the lab/out entries; "report" (sandbox still running, it may
+# still be using them) only lists them. Never aborts: a failed step is reported.
+scan_outputs() {
+    local mode=$1 f src rel hits=()
+    if [ "$mode" = defuse ]; then
+        # The sandbox writes as your UID; reopen directories it locked with chmod.
+        chmod -R u+rwX -- "$LAB_OUT" 2>/dev/null || true
+    fi
+    while IFS= read -r -d '' f; do
+        rel=${f#"$LAB_OUT"/}
+        rel=${rel//$'\n'/\\n}
+        if [ "$mode" = report ]; then
+            hits+=("lab/out: not a regular file (removed at sbx down): $rel")
+        elif rm -f -- "$f" 2>/dev/null; then
+            hits+=("lab/out: removed (not a regular file): $rel")
+        else
+            hits+=("lab/out: COULD NOT remove (not a regular file): $rel")
+        fi
+    done < <(find "$LAB_OUT" -mindepth 1 ! -type f ! -type d -print0 2>/dev/null)
+    while IFS= read -r -d '' f; do
+        rel=${f#"$LAB_OUT"/}
+        rel=${rel//$'\n'/\\n}
+        if [ "$mode" = report ]; then
+            hits+=("lab/out: $rel (renamed at sbx down)")
+        elif mv -T -- "$f" "$f.sbx-quarantine-$(date +%Y%m%d%H%M%S%N)" 2>/dev/null; then
+            hits+=("lab/out: quarantined (renamed): $rel")
+        else
+            hits+=("lab/out: COULD NOT quarantine: $rel")
+        fi
+    done < <(find "$LAB_OUT" -mindepth 1 \( -name .git -o -name .envrc \) -prune -print0 2>/dev/null)
+    if [ -f "$UP_STAMP" ] && exists "$CTR"; then
+        while IFS= read -r src; do
+            case $src in ''|"$SBX_ROOT"/*) continue ;; esac
+            while IFS= read -r -d '' f; do
+                hits+=("rw mount: new ${f//$'\n'/\\n}")
+            done < <(find "$src" -xdev -cnewer "$UP_STAMP" \( -name .git -o -name .envrc -o -type l \) -print0 2>/dev/null)
+        done < <(podman container inspect -f '{{range .Mounts}}{{if .RW}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$CTR" 2>/dev/null)
+    fi
+    [ ${#hits[@]} -gt 0 ] || return 0
+    note "WARNING: review before using these on the host (git hooks/config, direnv and symlinks act on the host):"
+    printf '  %s\n' "${hits[@]}" | sanitize >&2
+    if [ "$mode" = report ]; then
+        note "the sandbox is still running: read results with 'sbx cat', not from the host; sbx down re-checks"
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------ lifecycle
+
+ensure_networks() {
+    if ! podman network exists "$NET_INT"; then
+        podman network create --internal --disable-dns \
+            --subnet "$SUBNET" --gateway "$GATEWAY" "$NET_INT" >/dev/null
+    fi
+    [ "$(podman network inspect -f '{{.Internal}} {{.DNSEnabled}}' "$NET_INT")" = "true false" ] \
+        || die "network $NET_INT must be --internal without DNS; remove it (podman network rm $NET_INT)"
+    podman network exists "$NET_EXT" || podman network create "$NET_EXT" >/dev/null
+}
+
+save_egress_log() {
+    local f
+    exists "$EGRESS" || return 0
+    mkdir -p "$LOGS"
+    f=$LOGS/egress-$(date +%Y%m%d-%H%M%S).log
+    podman logs "$EGRESS" > "$f" 2>&1 || true
+    note "proxy log saved: ${f#"$SBX_ROOT"/}"
+}
+
+stop_all() {
+    # Stop the sandbox before scanning: a process the agent left running could
+    # otherwise re-plant files after the scan or race it.
+    podman stop -t 5 --ignore "$CTR" >/dev/null 2>&1 || true
+    if is_running "$CTR"; then podman kill "$CTR" >/dev/null 2>&1 || true; fi
+    if is_running "$CTR"; then
+        note "WARNING: could not stop $CTR, so lab/out was NOT checked; do not use it from the host, run sbx down again"
+    else
+        scan_outputs defuse || true
+    fi
+    save_egress_log
+    podman rm -f -t 5 --ignore "$CTR" "$EGRESS" >/dev/null
+}
+
+# Podman's default seccomp profile allows clone/clone3/unshare without limits
+# (for nested containers). Derive a profile that refuses new namespaces, as
+# Docker's default does: no user namespace means no in-container "root" and a
+# much smaller kernel attack surface. clone3 cannot be filtered by flags, so it
+# returns ENOSYS and libc falls back to clone.
+write_seccomp_profile() {
+    local ns_flags=2114060288   # CLONE_NEWNS|NEWCGROUP|NEWUTS|NEWIPC|NEWUSER|NEWPID|NEWNET
+    [ -r "$SECCOMP_DEFAULT" ] || die "missing $SECCOMP_DEFAULT (containers-common)"
+    mkdir -p "$(dirname "$SECCOMP")"
+    jq --argjson ns "$ns_flags" '
+        .syscalls |= map(.names |= map(select(. != "clone" and . != "clone3" and . != "unshare")))
+        | .syscalls |= map(select(.names | length > 0))
+        | .syscalls += [
+            {names: ["clone", "unshare"], action: "SCMP_ACT_ALLOW",
+             args: [{index: 0, value: $ns, valueTwo: 0, op: "SCMP_CMP_MASKED_EQ"}]},
+            {names: ["clone3"], action: "SCMP_ACT_ERRNO", errnoRet: 38}
+          ]' "$SECCOMP_DEFAULT" > "$SECCOMP.tmp"
+    mv "$SECCOMP.tmp" "$SECCOMP"
+}
+
+cmd_up() {
+    local net=api replace=0 spec c m
+    local specs=() copies=() secret_args=() net_args=() env_args=()
+    MOUNT_ARGS=() MOUNT_SPECS=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --net)      need_arg "$1" "${2:-}"; net=$2; shift 2 ;;
+            --mount|-m) need_arg "$1" "${2:-}"; specs+=("$2"); shift 2 ;;
+            --copy|-c)  need_arg "$1" "${2:-}"; copies+=("$2"); shift 2 ;;
+            --replace)  replace=1; shift ;;
+            *) die "up: unknown option '$1' (sbx help)" ;;
+        esac
+    done
+    case $net in api|open|none) ;; *) die "--net must be api, open or none" ;; esac
+    podman image exists "$IMAGE" || die "image $IMAGE is missing (sbx build)"
+    if [ "$net" != none ]; then
+        podman image exists "$IMG_EGRESS" || die "image $IMG_EGRESS is missing (sbx build egress)"
+    fi
+    if exists "$CTR" || exists "$EGRESS"; then
+        [ "$replace" = 1 ] || die "sandbox already exists; run sbx down first, or sbx up --replace"
+    fi
+    # Refuse bad copies before the old sandbox is gone.
+    for c in "${copies[@]}"; do check_copy "$c" >/dev/null; done
+    if exists "$CTR" || exists "$EGRESS"; then stop_all; fi
+    # Validate mounts only now, so a running sandbox cannot swap a path
+    # between the check and the mount.
+    for spec in "${specs[@]}"; do add_mount "$spec"; done
+
+    mkdir -p "$STATE_HOME" "$LAB_IN" "$LAB_OUT" "$RUNS" "$LOGS"
+    for c in "${copies[@]}"; do copy_in "$c"; done
+    write_seccomp_profile
+
+    if podman secret exists "$SECRET"; then
+        secret_args=(--secret "$SECRET,type=env,target=CLAUDE_CODE_OAUTH_TOKEN")
+    else
+        note "no token stored yet (sbx token set) — Claude cannot log in until then"
+    fi
+
+    if [ "$net" = none ]; then
+        net_args=(--network none)
+    else
+        ensure_networks
+        podman run -d --init --name "$EGRESS" --hostname "$EGRESS" \
+            --network "$NET_INT:ip=$EGRESS_IP" --network "$NET_EXT" \
+            --cap-drop=ALL --security-opt=no-new-privileges --read-only \
+            --pids-limit 256 --memory 512m \
+            -e SBX_NET="$net" -e TZ="$(host_tz)" \
+            "$IMG_EGRESS" >/dev/null
+        net_args=(--network "$NET_INT:ip=$SBX_IP")
+        env_args=(-e "HTTPS_PROXY=$PROXY_URL" -e "HTTP_PROXY=$PROXY_URL"
+                  -e "https_proxy=$PROXY_URL" -e "http_proxy=$PROXY_URL"
+                  -e "NO_PROXY=localhost,127.0.0.1,::1" -e "no_proxy=localhost,127.0.0.1,::1")
+    fi
+
+    if ! podman run -d --name "$CTR" --hostname "$CTR" \
+            "${net_args[@]}" \
+            --userns=keep-id --user 1000:1000 \
+            --cap-drop=ALL --security-opt=no-new-privileges \
+            --security-opt "seccomp=$SECCOMP" \
+            --read-only --tmpfs /tmp:rw,exec,nosuid,nodev,size=2g \
+            --pids-limit 4096 --memory "$MEMORY" --cpus "$CPUS" --shm-size 1g \
+            "${secret_args[@]}" "${env_args[@]}" \
+            -e SBX_NET="$net" -e HOME=/home/agent -e TZ="$(host_tz)" \
+            -v "$STATE_HOME:/home/agent:Z" \
+            -v "$LAB_IN:/lab/in:ro,Z" \
+            -v "$LAB_OUT:/lab/out:rw,Z" \
+            "${MOUNT_ARGS[@]}" \
+            --label "sbx.net=$net" \
+            "$IMAGE" >/dev/null; then
+        stop_all
+        die "starting the sandbox failed"
+    fi
+    # Everything changed after this stamp was written by the sandbox. Set only
+    # now: podman's relabelling (:z) at start also bumps the ctime of mounted
+    # files, and the agent only runs once something is exec'd into the box.
+    touch "$UP_STAMP"
+
+    # Remember --net/--mount (not --copy) for `sbx restart`.
+    {
+        printf '%s\0' --net "$net"
+        for m in "${MOUNT_SPECS[@]}"; do printf '%s\0' --mount "$m"; done
+    } > "$LAST_UP"
+    note "sandbox running (net=$net). Next: sbx selftest · sbx ask \"...\" · sbx tui"
+}
+
+cmd_restart() {
+    local args=()
+    [ -f "$LAST_UP" ] || die "nothing to restart yet (sbx up)"
+    mapfile -d '' -t args < "$LAST_UP"
+    cmd_up --replace "${args[@]}"
+}
+
+cmd_status() {
+    local c img
+    for c in "$CTR" "$EGRESS"; do
+        if exists "$c"; then
+            printf '%-11s %s\n' "$c" "$(podman container inspect -f '{{.State.Status}} ({{.ImageName}})' "$c")"
+        else
+            printf '%-11s %s\n' "$c" "not created"
+        fi
+    done
+    if exists "$CTR"; then
+        printf '%-11s %s\n' network "$(podman container inspect -f '{{index .Config.Labels "sbx.net"}}' "$CTR")"
+        echo "mounts:"
+        podman container inspect -f '{{range .Mounts}}  {{if .RW}}rw{{else}}ro{{end}}  {{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' "$CTR" | sed '/^$/d'
+    fi
+    if podman secret exists "$SECRET"; then
+        printf '%-11s %s\n' token "stored (podman secret $SECRET)"
+    else
+        printf '%-11s %s\n' token "missing (sbx token set)"
+    fi
+    for img in "$IMG_BASE" "$IMG_REA" "$IMG_EGRESS"; do
+        if podman image exists "$img"; then
+            printf '%-11s %s %s\n' image "$img" "$(podman image inspect -f '{{.Created.Format "2006-01-02 15:04"}}' "$img")"
+        else
+            printf '%-11s %s missing\n' image "$img"
+        fi
+    done
+}
+
+cmd_reset() {
+    local answer
+    if exists "$CTR"; then die "stop the sandbox first (sbx down)"; fi
+    if [ "${1:-}" != --yes ]; then
+        [ -t 0 ] || die "reset: confirm with --yes"
+        read -rp "Delete the sandbox home in state/home (Claude sessions, caches)? [y/N] " answer
+        [[ $answer == [yY]* ]] || die "aborted"
+    fi
+    # `podman unshare` so that files owned by other container UIDs go too.
+    podman unshare rm -rf -- "$STATE_HOME"
+    mkdir -p "$STATE_HOME"
+    note "sandbox home wiped"
+}
+
+# ------------------------------------------------------------------- building
+
+load_versions() {
+    local line
+    BUILD_ARGS=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ $line =~ ^[[:space:]]*(#|$) ]]; then continue; fi
+        [[ $line =~ ^[A-Z0-9_]+=[^[:space:]]+$ ]] || die "versions.env: invalid line: $line"
+        BUILD_ARGS+=(--build-arg "$line")
+    done < "$SBX_ROOT/versions.env"
+}
+
+# build_image IMAGE NAME [PODMAN-BUILD-OPTS...]
+build_image() {
+    local img=$1 name=$2
+    shift 2
+    note "building $img"
+    podman build -t "$img" -f "$SBX_ROOT/images/$name/Containerfile" \
+        "${BUILD_ARGS[@]}" "$@" "$SBX_ROOT"
+}
+
+cmd_build() {
+    local what=all nocache=() pull=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            base|rea|egress|all) what=$1 ;;
+            --no-cache) nocache=(--no-cache) ;;
+            --pull) pull=(--pull=always) ;;
+            *) die "build: unknown argument '$1'" ;;
+        esac
+        shift
+    done
+    load_versions
+    # The rea image builds on the local base image, so it is never pulled.
+    case $what in
+        base)   build_image "$IMG_BASE" base "${nocache[@]}" "${pull[@]}" ;;
+        rea)    build_image "$IMG_REA" rea "${nocache[@]}" ;;
+        egress) build_image "$IMG_EGRESS" egress "${nocache[@]}" "${pull[@]}" ;;
+        all)    build_image "$IMG_BASE" base "${nocache[@]}" "${pull[@]}"
+                build_image "$IMG_REA" rea "${nocache[@]}"
+                build_image "$IMG_EGRESS" egress "${nocache[@]}" "${pull[@]}" ;;
+    esac
+}
+
+# ------------------------------------------------------------- token (secret)
+
+cmd_token() {
+    local tok
+    case ${1:-} in
+        set)
+            if [ -t 0 ]; then
+                read -rsp 'Token from "claude setup-token": ' tok
+                echo >&2
+            else
+                IFS= read -r tok || true
+            fi
+            tok=${tok//[[:space:]]/}
+            [ -n "$tok" ] || die "empty token"
+            [[ $tok == sk-ant-oat01-* ]] || note "warning: this does not look like a setup-token (sk-ant-oat01-...); storing it anyway"
+            printf '%s' "$tok" | podman secret create --replace "$SECRET" - >/dev/null
+            note "token stored as podman secret '$SECRET'"
+            if exists "$CTR"; then note "apply it to the running sandbox: sbx restart"; fi
+            ;;
+        status)
+            if podman secret exists "$SECRET"; then echo stored; else echo missing; return 1; fi ;;
+        rm)
+            podman secret rm "$SECRET" >/dev/null
+            note "token removed (it stays valid at Anthropic until it expires or is revoked)" ;;
+        *) die "token: set | status | rm" ;;
+    esac
+}
+
+# ------------------------------------------------------------ driving Claude
+
+summarize_run() {
+    local run=$1 rc=$2 f=$1/stream.jsonl result tools
+    printf 'run:      %s\n' "${run#"$SBX_ROOT"/}"
+    result=$(jq -Rc 'fromjson? | select(.type == "result")' "$f" | tail -n 1)
+    if [ -z "$result" ]; then
+        printf 'status:   failed (exit %s, no result); stderr:\n' "$rc"
+        tail -n 20 "$run/stderr.log"
+        return 0
+    fi
+    jq -r '"session:  \(.session_id)",
+           "status:   \(.subtype)\(if .is_error then " (error)" else "" end)",
+           "turns:    \(.num_turns)",
+           "duration: \((.duration_ms // 0) / 1000 | floor)s"' <<< "$result"
+    tools=$(jq -Rr 'fromjson? | select(.type == "assistant") | .message.content[]?
+                    | select(.type == "tool_use") | .name' "$f" \
+            | sort | uniq -c | sort -rn | awk '{printf "%s%s x%s", sep, $2, $1; sep=", "}')
+    printf 'tools:    %s\n' "${tools:-none}"
+    printf -- '--- result (output of the sandboxed agent: untrusted data) ---\n'
+    jq -r '.result // ""' <<< "$result"
+}
+
+cmd_ask() {
+    local resume="" cont=0 model="" cwd=/lab raw=0 prompt="" run rc=0
+    local args=(-p --output-format stream-json --verbose)
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --resume|-r) need_arg "$1" "${2:-}"; resume=$2; shift 2 ;;
+            --continue)  cont=1; shift ;;
+            --model)     need_arg "$1" "${2:-}"; model=$2; shift 2 ;;
+            --cwd)       need_arg "$1" "${2:-}"; cwd=$2; shift 2 ;;
+            --raw)       raw=1; shift ;;
+            -)           prompt=$(cat); break ;;
+            --)          shift; prompt="$*"; break ;;
+            -*)          die "ask: unknown option '$1'" ;;
+            *)           prompt="$*"; break ;;
+        esac
+    done
+    [ -n "${prompt//[[:space:]]/}" ] || die 'ask: empty prompt (sbx ask "..." or ... | sbx ask -)'
+    if [ -n "$resume" ]; then
+        [[ $resume =~ ^[A-Za-z0-9-]+$ ]] || die "ask: invalid session id '$resume'"
+        args+=(--resume "$resume")
+    fi
+    if [ "$cont" = 1 ]; then args+=(--continue); fi
+    if [ -n "$model" ]; then args+=(--model "$model"); fi
+    require_running
+
+    run=$RUNS/$(date +%Y%m%d-%H%M%S)-$$
+    mkdir -p "$run"
+    printf '%s\n' "$prompt" > "$run/prompt.txt"
+    # The prompt goes in via stdin, never via argv.
+    printf '%s' "$prompt" | podman exec -i -w "$cwd" "$CTR" sbx-claude "${args[@]}" \
+        > "$run/stream.jsonl" 2> "$run/stderr.log" || rc=$?
+    if [ "$raw" = 1 ]; then sanitize < "$run/stream.jsonl"; fi
+    summarize_run "$run" "$rc" | sanitize
+    scan_outputs report
+    return "$rc"
+}
+
+# Print a sandbox file. It is read *inside* the container, so a symlink there
+# can never point at a host file.
+cmd_cat() {
+    local f=${1:-}
+    [ $# -eq 1 ] && [ -n "$f" ] || die "cat: FILE (relative to /lab/out, or absolute inside the sandbox)"
+    require_running
+    case $f in /*) ;; *) f=/lab/out/$f ;; esac
+    podman exec "$CTR" cat -- "$f" | sanitize
+}
+
+has_tui() { podman exec "$CTR" tmux has-session -t "$TMUX_SESSION" 2>/dev/null; }
+
+cmd_tui() {
+    require_running
+    if has_tui; then
+        note "tmux session '$TMUX_SESSION' is already running"
+    else
+        # Fail here, not silently inside a tmux session that ends at once.
+        podman exec "$CTR" sh -c 'test -n "${CLAUDE_CODE_OAUTH_TOKEN:-}"' \
+            || die "no token in the sandbox (sbx token set, then sbx restart)"
+        podman exec -w /lab "$CTR" tmux new-session -d -s "$TMUX_SESSION" -x 200 -y 50 sbx-claude "$@"
+        sleep 2
+        has_tui || die "Claude exited right after start; run 'sbx sh -- sbx-claude' to see why"
+        note "interactive Claude started in tmux session '$TMUX_SESSION'"
+    fi
+    note "watch or drive it: sbx attach (detach: Ctrl-b d) · sbx screen · sbx keys"
+}
+
+cmd_screen() {
+    local hist=${1:-0}
+    [[ $hist =~ ^[0-9]+$ ]] || die "screen: LINES must be a number"
+    require_running
+    podman exec "$CTR" tmux capture-pane -p -J -t "$TMUX_SESSION" -S "-$hist" | sanitize
+}
+
+cmd_keys() {
+    require_running
+    case ${1:-} in
+        --key)
+            shift
+            [ $# -gt 0 ] || die "keys --key needs key names (Enter, Escape, C-c, ...)"
+            podman exec "$CTR" tmux send-keys -t "$TMUX_SESSION" "$@" ;;
+        --enter)
+            shift
+            podman exec "$CTR" tmux send-keys -t "$TMUX_SESSION" -l -- "$*"
+            podman exec "$CTR" tmux send-keys -t "$TMUX_SESSION" Enter ;;
+        '') die "keys: nothing to send" ;;
+        *)  podman exec "$CTR" tmux send-keys -t "$TMUX_SESSION" -l -- "$*" ;;
+    esac
+}
+
+# ------------------------------------------------------------------ inspection
+
+cmd_sh() {
+    require_running
+    if [ "${1:-}" = -- ]; then shift; fi
+    if [ $# -eq 0 ]; then
+        exec podman exec -it -w /lab "$CTR" bash -l
+    elif [ -t 0 ] && [ -t 1 ]; then
+        exec podman exec -it -w /lab "$CTR" "$@"
+    else
+        exec podman exec -i -w /lab "$CTR" "$@"
+    fi
+}
+
+cmd_egress() {
+    local follow=() all=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -f) follow=(-f) ;;
+            --all) all=1 ;;
+            *) die "egress: [-f] [--all]" ;;
+        esac
+        shift
+    done
+    exists "$EGRESS" || die "proxy is not running (saved logs are in logs/)"
+    if [ "$all" = 1 ]; then
+        podman logs "${follow[@]}" "$EGRESS" 2>&1 | sanitize
+    else
+        podman logs "${follow[@]}" "$EGRESS" 2>&1 | { grep --line-buffered '^EGRESS ' || true; } \
+            | cut -d' ' -f2- | sanitize
+    fi
+}
+
+# UDP datagrams the proxy has sent so far (its DNS lookups), per /proc/net/snmp
+# of the proxy's network namespace.
+proxy_udp_out() {
+    podman exec "$EGRESS" cat /proc/net/snmp | awk '$1 == "Udp:" && $2 ~ /^[0-9]+$/ {print $5; exit}'
+}
+
+# In api mode the proxy must refuse other names *without* resolving them: a
+# DNS lookup alone carries data to whoever runs the name's nameserver.
+check_dns_leak() {
+    local before after
+    before=$(proxy_udp_out)
+    podman exec "$CTR" curl -s -o /dev/null --max-time 10 "https://sbx-leak-$RANDOM$RANDOM.example.com/" || true
+    podman exec "$CTR" curl -s -o /dev/null --max-time 10 "http://sbx-leak-$RANDOM$RANDOM.example.com/" || true
+    podman exec "$CTR" curl -s -o /dev/null --max-time 10 "https://203.0.113.7/" || true
+    after=$(proxy_udp_out)
+    if [ -n "$before" ] && [ "$before" = "$after" ]; then
+        echo "PASS  proxy refuses other names without a DNS lookup"
+        return 0
+    fi
+    echo "FAIL  proxy sent ${before:+$((after - before)) }UDP datagrams for refused names (DNS leak; a concurrent Claude run can cause false alarms)"
+    return 1
+}
+
+cmd_selftest() {
+    local args=() gw ip rc=0
+    require_running
+    # Host-side addresses that must stay unreachable: LAN gateway, host IPs,
+    # cloud metadata, the internal network's gateway.
+    gw=$(ip -4 route show default | awk '{print $3; exit}')
+    if [ -n "$gw" ]; then args+=(--probe "$gw"); fi
+    while read -r ip; do
+        args+=(--probe "${ip%/*}")
+    done < <(ip -4 -o addr show scope global | awk '{print $4}')
+    args+=(--probe 169.254.169.254 --probe "$GATEWAY" --absent "$HOME" --absent "/run/user/$(id -u)")
+    podman exec "$CTR" sbx-selftest "${args[@]}" | sanitize || rc=$?
+    if [ "$(podman container inspect -f '{{index .Config.Labels "sbx.net"}}' "$CTR")" = api ]; then
+        echo "== host-side checks"
+        check_dns_leak || rc=$((rc + 1))
+    fi
+    return "$rc"
+}
+
+cmd_check() {
+    local spec rc=0
+    [ $# -gt 0 ] || die "check: PATH[:ro|:rw]..."
+    for spec in "$@"; do
+        if (MOUNT_ARGS=() MOUNT_SPECS=(); add_mount "$spec") 2>&1; then
+            echo "OK       $spec"
+        else
+            echo "REFUSED  $spec"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
+main() {
+    local cmd=${1:-help} p
+    [ "$(id -u)" -ne 0 ] || die "refusing to run as root: rootless podman is the isolation boundary"
+    if [ $# -gt 0 ]; then shift; fi
+    case $cmd in
+        build)    cmd_build "$@" ;;
+        up)       cmd_up "$@" ;;
+        restart)  cmd_restart ;;
+        down)     stop_all; note "sandbox stopped" ;;
+        status)   cmd_status ;;
+        reset)    cmd_reset "$@" ;;
+        in)       [ $# -gt 0 ] || die "in: PATH..."; for p in "$@"; do copy_in "$p"; done ;;
+        check)    cmd_check "$@" ;;
+        ask)      cmd_ask "$@" ;;
+        cat)      cmd_cat "$@" ;;
+        tui)      cmd_tui "$@" ;;
+        attach)   require_running; exec podman exec -it "$CTR" tmux attach -t "$TMUX_SESSION" ;;
+        screen)   cmd_screen "$@" ;;
+        keys)     cmd_keys "$@" ;;
+        sh|exec)  cmd_sh "$@" ;;
+        egress)   cmd_egress "$@" ;;
+        selftest) cmd_selftest ;;
+        token)    cmd_token "$@" ;;
+        help|-h|--help) usage ;;
+        *) die "unknown command '$cmd' (sbx help)" ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,21 @@
+#!/bin/bash
+# Start Claude Code with the sandbox defaults:
+#   - only the MCP servers shipped in the image (/etc/claude-sbx/mcp.json)
+#   - no permission prompts: the container is the security boundary
+#   - web tools off in "api" mode, where only the Anthropic API is reachable
+set -euo pipefail
+
+case "${SBX_NET:-none}" in
+    api)  web=(--disallowedTools "WebFetch,WebSearch") ;;
+    open) web=() ;;
+    *)    echo "sbx-claude: no network (SBX_NET=${SBX_NET:-none}); start the sandbox with --net api or --net open." >&2
+          exit 2 ;;
+esac
+
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    echo "sbx-claude: CLAUDE_CODE_OAUTH_TOKEN is not set; run 'sbx token set' on the host, then 'sbx restart'." >&2
+    exit 2
+fi
+
+exec claude --mcp-config /etc/claude-sbx/mcp.json --strict-mcp-config \
+    --permission-mode bypassPermissions "${web[@]}" "$@"

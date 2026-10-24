@@ -1,0 +1,55 @@
+# claude-sbx base image: Claude Code without any host configuration.
+#
+# bin/sbx runs it rootless with a read-only root filesystem, all capabilities
+# dropped and network access only through the sbx-egress proxy. Claude
+# authenticates with a setup-token (CLAUDE_CODE_OAUTH_TOKEN, a podman secret),
+# which can only make model requests: no claude.ai connectors, no Remote Control.
+#
+# Build with `sbx build base` (passes the pinned versions from versions.env).
+
+ARG FEDORA_IMAGE=registry.fedoraproject.org/fedora:44
+FROM ${FEDORA_IMAGE}
+
+ARG CLAUDE_CODE_VERSION
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TERM=xterm-256color \
+    DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+# Do not put `# comment` lines between the continued lines below: the parser
+# joins them into one shell line and the comment swallows the rest.
+RUN dnf -y update && dnf -y install --setopt=install_weak_deps=False \
+        bash tini tmux less which findutils procps-ng iproute \
+        git jq ripgrep file binutils vim-common \
+        tar gzip xz unzip curl ca-certificates python3 \
+        nodejs24 nodejs24-npm \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+# Claude Code from npm, pinned. npm checks every tarball against the registry's
+# integrity hash; the postinstall step links the native linux-x64 binary.
+RUN npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    && claude --version
+
+# Unprivileged user with UID 1000, so `--userns=keep-id` maps it to the host
+# user and files written to rw mounts stay owned by that user.
+RUN useradd -m -u 1000 -U -s /bin/bash agent \
+    && mkdir -p /lab/in /lab/out /host /opt/claude-sbx/skel/.claude \
+    && chown -R agent:agent /lab /opt/claude-sbx/skel
+
+COPY container/sbx-entrypoint container/sbx-claude container/sbx-selftest /usr/local/bin/
+COPY container/managed-settings.json container/CLAUDE.md /etc/claude-code/
+COPY container/mcp.json /etc/claude-sbx/mcp.json
+COPY container/tmux.conf /etc/tmux.conf
+COPY container/claude.json /opt/claude-sbx/claude.json
+RUN chmod 0755 /usr/local/bin/sbx-entrypoint /usr/local/bin/sbx-claude /usr/local/bin/sbx-selftest \
+    && echo "claude-code=${CLAUDE_CODE_VERSION}" > /opt/claude-sbx/skel/.sbx-skel-version
+
+LABEL org.opencontainers.image.title="claude-sbx-base" \
+      sbx.claude-code.version="${CLAUDE_CODE_VERSION}"
+
+USER agent
+WORKDIR /lab
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/sbx-entrypoint"]
+CMD ["sleep", "infinity"]

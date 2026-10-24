@@ -1,0 +1,5 @@
+# Runtime data of the sandbox — never commit
+/state/
+/lab/
+/runs/
+/logs/

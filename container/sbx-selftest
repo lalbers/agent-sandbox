@@ -1,0 +1,122 @@
+#!/bin/bash
+# Isolation checks inside the running sandbox; started by `sbx selftest`.
+#   --probe IP     host-side address (LAN gateway, host IPs, ...) that must stay unreachable
+#   --absent PATH  host path that must not exist in here
+# Prints PASS/FAIL/INFO lines; the exit status is the number of failures.
+set -uo pipefail
+
+fails=0
+pass() { printf 'PASS  %s\n' "$*"; }
+fail() { printf 'FAIL  %s\n' "$*"; fails=$((fails + 1)); }
+info() { printf 'INFO  %s\n' "$*"; }
+expect_ok()   { local d=$1; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else fail "$d"; fi; }
+expect_fail() { local d=$1; shift; if "$@" >/dev/null 2>&1; then fail "$d"; else pass "$d"; fi; }
+
+probes=() absent=()
+while [ $# -gt 0 ]; do
+    case $1 in
+        --probe)  probes+=("$2"); shift 2 ;;
+        --absent) absent+=("$2"); shift 2 ;;
+        *) echo "sbx-selftest: unknown argument $1" >&2; exit 64 ;;
+    esac
+done
+mode=${SBX_NET:-none}
+
+tcp_connect() { timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2"; }
+# Status from the target ("000" = no response from it) and of the proxy CONNECT.
+http_code()    { curl -s -o /dev/null --max-time 20 -w '%{http_code}' "$@"; }
+connect_code() { curl -s -o /dev/null --max-time 20 -w '%{http_connect}' "$@"; }
+# True if the proxy itself refused the request (squid tags its error pages).
+proxy_denied() {
+    curl -s -D - -o /dev/null --max-time 20 --noproxy '' -x "$HTTP_PROXY" "$1" \
+        | tr -d '\r' | grep -qi '^X-Squid-Error: ERR_ACCESS_DENIED'
+}
+
+echo "== confinement"
+expect_ok "runs as non-root (uid $(id -u))" test "$(id -u)" -ne 0
+expect_ok "no effective capabilities" grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status
+expect_ok "no_new_privs is set" grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
+expect_ok "seccomp filter is active" grep -Eq '^Seccomp:[[:space:]]+2$' /proc/self/status
+label=$(tr -d '\0' < /proc/self/attr/current 2>/dev/null)
+case $label in
+    *:container_t:*) pass "SELinux domain $label" ;;
+    *) fail "SELinux domain '${label:-unknown}' (expected container_t)" ;;
+esac
+# New namespaces (above all user namespaces, i.e. in-container "root") are
+# refused by the seccomp profile, via unshare(2) as well as clone(2); clone3
+# must return ENOSYS because seccomp cannot inspect its flags.
+expect_fail "no user namespace via unshare(2)" python3 -c 'import os; os.unshare(os.CLONE_NEWUSER)'
+expect_fail "no user namespace via clone(2)" python3 -c '
+import ctypes, os, sys
+r = ctypes.CDLL(None, use_errno=True).syscall(56, 0x10000000 | 17, 0, 0, 0, 0)
+if r == 0:
+    os._exit(0)
+sys.exit(0 if r > 0 else 1)'
+expect_ok "clone3 refused with ENOSYS" python3 -c '
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+sys.exit(0 if libc.syscall(435, 0, 0) == -1 and ctypes.get_errno() == 38 else 1)'
+expect_fail "root filesystem is read-only" touch /usr/.sbx-selftest
+expect_ok "home is writable" bash -c ': > "$HOME/.sbx-selftest" && rm -f "$HOME/.sbx-selftest"'
+
+echo "== host data"
+for p in "${absent[@]}"; do expect_fail "host path not visible: $p" test -e "$p"; done
+expect_fail "no ANTHROPIC_API_KEY" test -n "${ANTHROPIC_API_KEY:-}"
+expect_fail "no SSH agent" test -n "${SSH_AUTH_SOCK:-}"
+expect_fail "no Wayland/X11 display" test -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}"
+expect_fail "no D-Bus session bus" test -n "${DBUS_SESSION_BUS_ADDRESS:-}"
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    info "setup-token present (value not shown)"
+else
+    info "no setup-token (sbx token set)"
+fi
+
+echo "== network ($mode)"
+expect_fail "no default route" bash -c 'ip route show default | grep -q .'
+expect_fail "no DNS resolution" getent hosts example.com
+expect_fail "no direct connection to 1.1.1.1:443" tcp_connect 1.1.1.1 443
+for ip in "${probes[@]}"; do expect_fail "no direct connection to $ip:80" tcp_connect "$ip" 80; done
+
+if [ "$mode" = api ] || [ "$mode" = open ]; then
+    c=$(http_code https://api.anthropic.com/)
+    if [ "$c" != 000 ]; then pass "Anthropic API reachable via proxy (HTTP $c)"; else fail "Anthropic API not reachable via proxy"; fi
+    if [ "$mode" = api ]; then
+        c=$(connect_code https://example.com/)
+        if [ "$c" = 403 ]; then pass "other hosts refused (example.com)"; else fail "example.com not refused (CONNECT $c)"; fi
+    else
+        c=$(http_code https://example.com/)
+        if [ "$c" != 000 ]; then pass "public internet reachable (example.com HTTP $c)"; else fail "example.com not reachable"; fi
+    fi
+    for target in "${probes[@]}" 127.0.0.1 host.containers.internal; do
+        if proxy_denied "http://$target/"; then pass "proxy refuses http://$target/"; else fail "proxy does not refuse http://$target/"; fi
+        c=$(connect_code --noproxy '' -x "$HTTP_PROXY" "https://$target/")
+        if [ "$c" = 403 ]; then pass "proxy refuses CONNECT $target:443"; else fail "proxy does not refuse CONNECT $target:443 ($c)"; fi
+    done
+else
+    expect_fail "no network interface except loopback" bash -c 'ip -o link show | grep -v " lo:" | grep -q .'
+fi
+
+echo "== mounts"
+while read -r _ _ _ _ mnt opts _; do
+    mnt=$(printf '%b' "$mnt")
+    case $mnt in /lab/*|/host/*) ;; *) continue ;; esac
+    case ",$opts," in *,ro,*) m=ro ;; *) m=rw ;; esac
+    info "$m $mnt"
+    case $mnt in
+        /lab/in|*/.git)
+            if [ "$m" = ro ]; then pass "$mnt is read-only"; else fail "$mnt should be read-only"; fi ;;
+    esac
+    if [ "$m" = ro ]; then expect_fail "write refused on $mnt" touch "$mnt/.sbx-selftest"; fi
+done < /proc/self/mountinfo
+
+echo "== tools"
+for cmd in "claude --version" "node --version" "rea --version" "java -version" "chromium-browser --version"; do
+    set -- $cmd
+    if command -v "$1" >/dev/null; then info "$cmd: $("$@" 2>&1 | head -n 1)"; fi
+done
+if [ -n "${GHIDRA_INSTALL_DIR:-}" ]; then
+    expect_ok "Ghidra headless analyzer present" test -x "$GHIDRA_INSTALL_DIR/support/analyzeHeadless"
+fi
+
+echo "== $fails failure(s)"
+exit $(( fails > 125 ? 125 : fails ))

@@ -1,0 +1,22 @@
+# sbx-egress: squid forward proxy, the sandbox's only way out.
+#
+# The sandbox container sits on an --internal network without DNS or a default
+# route; this proxy is attached to that network and to a normal one.
+#   SBX_NET=api   only the hosts in allow-api.txt (Anthropic API)
+#   SBX_NET=open  any public destination
+# Both modes refuse private, loopback, link-local and multicast destinations,
+# so neither the LAN nor the host is reachable.
+
+ARG FEDORA_IMAGE=registry.fedoraproject.org/fedora:44
+FROM ${FEDORA_IMAGE}
+
+RUN dnf -y update && dnf -y install --setopt=install_weak_deps=False squid \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+COPY egress/ /etc/squid/sbx/
+RUN chmod 0755 /etc/squid/sbx/egress-entrypoint
+
+LABEL org.opencontainers.image.title="claude-sbx-egress"
+
+USER squid
+ENTRYPOINT ["/etc/squid/sbx/egress-entrypoint"]

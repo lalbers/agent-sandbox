@@ -1,0 +1,10 @@
+#!/bin/bash
+# Run squid in the foreground with the policy selected by $SBX_NET.
+set -euo pipefail
+
+case "${SBX_NET:-}" in
+    api|open) ;;
+    *) echo "sbx-egress: SBX_NET must be 'api' or 'open'" >&2; exit 2 ;;
+esac
+
+exec /usr/sbin/squid -N -f "/etc/squid/sbx/${SBX_NET}.conf"

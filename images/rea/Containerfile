@@ -1,0 +1,66 @@
+# claude-sbx REA image: base + REA (reverse-engineering MCP server) with
+# Ghidra 12.1.x, a JDK 21 and Chromium for browser observation.
+#
+# REA is only ever installed here, never on the host: npm install scripts,
+# Ghidra and every analysed target run inside the sandbox.
+#
+# Build with `sbx build rea` (needs the base image).
+
+ARG BASE_IMAGE=localhost/claude-sbx-base:latest
+FROM ${BASE_IMAGE}
+
+ARG REA_VERSION
+ARG GHIDRA_VERSION
+ARG GHIDRA_URL
+ARG GHIDRA_SHA256
+ARG JDK_URL
+ARG JDK_SHA256
+
+USER root
+
+# Chromium plus the GLES/EGL/DRI libraries REA's browser guide names for
+# minimal containers (without them the DevTools port may never open).
+RUN dnf -y install --setopt=install_weak_deps=False \
+        chromium libglvnd-gles mesa-libEGL mesa-dri-drivers \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+# Temurin JDK 21, checksum-verified.
+RUN curl -fsSL -o /tmp/jdk.tar.gz "$JDK_URL" \
+    && echo "$JDK_SHA256  /tmp/jdk.tar.gz" | sha256sum -c - \
+    && mkdir -p /opt/jdk \
+    && tar -xzf /tmp/jdk.tar.gz -C /opt/jdk --strip-components=1 \
+    && rm /tmp/jdk.tar.gz \
+    && /opt/jdk/bin/java -version
+
+# Ghidra, checksum-verified.
+RUN curl -fsSL -o /tmp/ghidra.zip "$GHIDRA_URL" \
+    && echo "$GHIDRA_SHA256  /tmp/ghidra.zip" | sha256sum -c - \
+    && unzip -q /tmp/ghidra.zip -d /opt \
+    && mv "/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra \
+    && rm /tmp/ghidra.zip
+
+# Fedora 44 merged sbin into bin; listing both makes REA see two installations.
+ENV JAVA_HOME=/opt/jdk \
+    GHIDRA_INSTALL_DIR=/opt/ghidra \
+    PATH=/opt/jdk/bin:/usr/local/bin:/usr/bin
+
+# REA from npm, pinned.
+RUN npm install -g --no-fund --no-audit "rea-agents@${REA_VERSION}" \
+    && rea --version
+
+COPY rea/mcp.json /etc/claude-sbx/mcp.json
+COPY rea/CLAUDE.md /tmp/CLAUDE-rea.md
+RUN cat /tmp/CLAUDE-rea.md >> /etc/claude-code/CLAUDE.md \
+    && rm /tmp/CLAUDE-rea.md \
+    && echo "rea=${REA_VERSION} ghidra=${GHIDRA_VERSION}" >> /opt/claude-sbx/skel/.sbx-skel-version
+
+LABEL org.opencontainers.image.title="claude-sbx-rea" \
+      sbx.rea.version="${REA_VERSION}" \
+      sbx.ghidra.version="${GHIDRA_VERSION}"
+
+# REA's bundled Claude Code skill goes into the home skeleton; the entrypoint
+# copies it into the persistent home. MCP registration is not needed: Claude
+# only loads /etc/claude-sbx/mcp.json (--strict-mcp-config).
+USER agent
+RUN HOME=/opt/claude-sbx/skel rea setup --skill-client claude_code --yes --json > /dev/null \
+    && test -f /opt/claude-sbx/skel/.claude/skills/reverse-engineer-anything/SKILL.md

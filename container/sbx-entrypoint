@@ -1,0 +1,16 @@
+#!/bin/bash
+# Seed the persistent home (state/home on the host) from the image skeleton,
+# then run the container command (default `sleep infinity`, so the host CLI
+# can `podman exec` into the running sandbox).
+set -euo pipefail
+
+skel=/opt/claude-sbx/skel
+
+# Image-owned files (e.g. the REA skill) are small; refresh them on every start
+# so the home always matches the image.
+cp -R "$skel/." "$HOME/"
+
+# Claude's own state file is only seeded once; Claude rewrites it at runtime.
+[ -f "$HOME/.claude.json" ] || cp /opt/claude-sbx/claude.json "$HOME/.claude.json"
+
+exec "$@"
