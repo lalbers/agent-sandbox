@@ -32,6 +32,14 @@ MOUNT_ROOTS=${SBX_MOUNT_ROOTS:-$HOME/Git:$HOME/Downloads}
 STATE_HOME=$SBX_ROOT/state/home
 LAST_UP=$SBX_ROOT/state/last-up
 UP_STAMP=$SBX_ROOT/state/up-stamp
+MODE_FILE=$SBX_ROOT/state/mode         # "container|vm NET" while a session is up
+VM_ARGS=$SBX_ROOT/state/vm-args        # podman run args + image for microVM runs
+STOPPING=$SBX_ROOT/state/stopping      # set while `sbx down` runs: no new microVMs
+VM_LABEL=sbx.vm
+# Fixed SELinux MCS categories for microVM runs: each run is a new container,
+# a stable level keeps relabelling a no-op (stable ctimes for scan_outputs)
+# while other containers on the host still cannot access these files.
+VM_LEVEL=s0:c701,c702
 SECCOMP=$SBX_ROOT/state/seccomp.json
 SECCOMP_DEFAULT=/usr/share/containers/seccomp.json
 LAB_IN=$SBX_ROOT/lab/in
@@ -48,7 +56,9 @@ Setup
   sbx token set|status|rm        store the token from "claude setup-token" as podman secret
 
 Lifecycle
-  sbx up [--net api|open|none] [--mount PATH[:ro|:rw]]... [--copy PATH]... [--replace]
+  sbx up [--net api|open|none] [--vm] [--mount PATH[:ro|:rw]]... [--copy PATH]... [--replace]
+                                 --vm: every command runs in a fresh libkrun microVM
+                                 (own guest kernel; for executing untrusted targets)
   sbx restart                    recreate with the last --net/--mount options (e.g. after token set)
   sbx down                       stop and remove (the proxy log is saved to logs/)
   sbx status
@@ -63,10 +73,11 @@ Files
 Driving Claude
   sbx ask [--resume ID|--continue] [--model M] [--cwd DIR] [--raw] PROMPT | -
   sbx tui [CLAUDE-ARGS]          interactive Claude in tmux inside the sandbox
-  sbx attach                     attach your terminal (detach: Ctrl-b d)
-  sbx screen [LINES]             print the tmux screen plus LINES of history
-  sbx keys [--enter] TEXT        type into the tmux session
-  sbx keys --key KEY...          send keys (Enter, Escape, C-c, ...)
+                                 (vm mode: directly in your terminal)
+  sbx attach                     attach your terminal (detach: Ctrl-b d)    [container mode]
+  sbx screen [LINES]             print the tmux screen plus LINES of history [container mode]
+  sbx keys [--enter] TEXT        type into the tmux session                  [container mode]
+  sbx keys --key KEY...          send keys (Enter, Escape, C-c, ...)         [container mode]
 
 Inspection
   sbx sh [-- CMD...]             shell or command inside the sandbox
@@ -87,8 +98,75 @@ note() { printf 'sbx: %s\n' "$*" >&2; }
 need_arg() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"; }
 exists() { podman container exists "$1"; }
 is_running() { [ "$(podman container inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
-require_running() { is_running "$CTR" || die "sandbox is not running (sbx up)"; }
 host_tz() { readlink -f /etc/localtime | sed -n 's|.*/zoneinfo/||p'; }
+
+session_active() { [ -f "$MODE_FILE" ]; }
+in_vm_mode() { [ "$(awk '{print $1}' "$MODE_FILE" 2>/dev/null)" = vm ]; }
+session_net() { awk '{print $2}' "$MODE_FILE" 2>/dev/null; }
+vm_runs() { podman ps -q --filter "label=$VM_LABEL=1" 2>/dev/null; }
+
+require_running() {
+    if in_vm_mode; then
+        [ "$(session_net)" = none ] || is_running "$EGRESS" || die "egress proxy is not running (sbx restart)"
+    else
+        is_running "$CTR" || die "sandbox is not running (sbx up)"
+    fi
+}
+
+require_container_mode() {
+    if in_vm_mode; then die "$1 is not available in vm mode (a microVM cannot be exec'd into); use sbx ask"; fi
+}
+
+# box [podman exec/run options...] -- CMD...: run CMD in the sandbox — exec
+# into the container, or in vm mode a fresh one-shot microVM with the settings
+# saved by `sbx up --vm`. Options: -i, -t, -w DIR.
+box() {
+    local opts=() saved=() rc=0
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do opts+=("$1"); shift; done
+    shift
+    if in_vm_mode; then
+        [ ! -f "$STOPPING" ] || die "the sandbox is being stopped"
+        mapfile -d '' -t saved < "$VM_ARGS"
+        # Named, and removed if sbx is interrupted: a killed podman client
+        # would otherwise leave the microVM (and the agent in it) running.
+        BOX_RUN=claude-sbx-run-$$-$RANDOM
+        BOX_PID=""
+        trap remove_box_run EXIT
+        trap 'remove_box_run; exit 130' INT TERM HUP
+        if [[ " ${opts[*]} " == *" -t "* ]]; then
+            # Interactive: stays in the foreground (Ctrl-C reaches the whole
+            # process group anyway).
+            podman run --rm --name "$BOX_RUN" "${opts[@]}" "${saved[@]}" "$@" || rc=$?
+        else
+            # In the background so that a signal to sbx alone interrupts
+            # `wait` and runs the trap right away.
+            podman run --rm --name "$BOX_RUN" "${opts[@]}" "${saved[@]}" "$@" <&0 &
+            BOX_PID=$!
+            wait "$BOX_PID" || rc=$?
+        fi
+        # Finished and removed (--rm): nothing left for the trap, whose kill
+        # could otherwise hit a reused PID.
+        BOX_PID="" BOX_RUN=""
+        return "$rc"
+    else
+        podman exec "${opts[@]}" "$CTR" "$@"
+    fi
+}
+
+remove_box_run() {
+    if [ -n "${BOX_PID:-}" ]; then kill "$BOX_PID" 2>/dev/null || true; fi
+    if [ -n "${BOX_RUN:-}" ]; then podman rm -f -t 0 --ignore "$BOX_RUN" >/dev/null 2>&1 || true; fi
+}
+
+# Size like "8g" or "512m" in MiB.
+to_mib() {
+    [[ $1 =~ ^[0-9]+[gGmM]$ ]] || die "size '$1' must be a whole number ending in g or m"
+    case $1 in
+        *[gG]) printf '%s\n' "$(( ${1%[gG]} * 1024 ))" ;;
+        *[mM]) printf '%s\n' "${1%[mM]}" ;;
+        *) die "size '$1' must end in g or m" ;;
+    esac
+}
 
 # Strip control characters (C0 except tab/newline, DEL, C1) from sandbox output
 # before it reaches a terminal: no escape sequences, clipboard writes or line
@@ -219,7 +297,7 @@ copy_in() {
 # removes/renames the lab/out entries; "report" (sandbox still running, it may
 # still be using them) only lists them. Never aborts: a failed step is reported.
 scan_outputs() {
-    local mode=$1 f src rel hits=()
+    local mode=$1 f src rel spec hits=() last=()
     if [ "$mode" = defuse ]; then
         # The sandbox writes as your UID; reopen directories it locked with chmod.
         chmod -R u+rwX -- "$LAB_OUT" 2>/dev/null || true
@@ -246,13 +324,15 @@ scan_outputs() {
             hits+=("lab/out: COULD NOT quarantine: $rel")
         fi
     done < <(find "$LAB_OUT" -mindepth 1 \( -name .git -o -name .envrc \) -prune -print0 2>/dev/null)
-    if [ -f "$UP_STAMP" ] && exists "$CTR"; then
-        while IFS= read -r src; do
-            case $src in ''|"$SBX_ROOT"/*) continue ;; esac
+    # rw mounts of the current session, as recorded by `sbx up` (canonical PATH:rw).
+    if [ -f "$UP_STAMP" ] && session_active && [ -f "$LAST_UP" ]; then
+        mapfile -d '' -t last < "$LAST_UP"
+        for spec in "${last[@]}"; do
+            case $spec in /*:rw) src=${spec%:rw} ;; *) continue ;; esac
             while IFS= read -r -d '' f; do
                 hits+=("rw mount: new ${f//$'\n'/\\n}")
             done < <(find "$src" -xdev -cnewer "$UP_STAMP" \( -name .git -o -name .envrc -o -type l \) -print0 2>/dev/null)
-        done < <(podman container inspect -f '{{range .Mounts}}{{if .RW}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$CTR" 2>/dev/null)
+        done
     fi
     [ ${#hits[@]} -gt 0 ] || return 0
     note "WARNING: review before using these on the host (git hooks/config, direnv and symlinks act on the host):"
@@ -285,17 +365,29 @@ save_egress_log() {
 }
 
 stop_all() {
-    # Stop the sandbox before scanning: a process the agent left running could
-    # otherwise re-plant files after the scan or race it.
+    local ids _
+    # Stop the sandbox (container and any microVM runs) before scanning: a
+    # process the agent left running could otherwise re-plant files after the
+    # scan or race it. The stopping flag keeps sbx from starting new microVMs.
+    mkdir -p "$(dirname "$STOPPING")"
+    touch "$STOPPING"
     podman stop -t 5 --ignore "$CTR" >/dev/null 2>&1 || true
     if is_running "$CTR"; then podman kill "$CTR" >/dev/null 2>&1 || true; fi
-    if is_running "$CTR"; then
-        note "WARNING: could not stop $CTR, so lab/out was NOT checked; do not use it from the host, run sbx down again"
+    for _ in 1 2 3; do
+        ids=$(podman ps -aq --filter "label=$VM_LABEL=1" 2>/dev/null) || ids=""
+        [ -n "$ids" ] || break
+        # shellcheck disable=SC2086  # one container ID per word
+        podman rm -f -t 0 $ids >/dev/null 2>&1 || true
+    done
+    if is_running "$CTR" || [ -n "$(vm_runs)" ]; then
+        note "WARNING: could not stop the sandbox, so lab/out was NOT checked; do not use it from the host, run sbx down again"
     else
         scan_outputs defuse || true
+        rm -f "$MODE_FILE" "$VM_ARGS"
     fi
     save_egress_log
     podman rm -f -t 5 --ignore "$CTR" "$EGRESS" >/dev/null
+    rm -f "$STOPPING"
 }
 
 # Podman's default seccomp profile allows clone/clone3/unshare without limits
@@ -319,14 +411,15 @@ write_seccomp_profile() {
 }
 
 cmd_up() {
-    local net=api replace=0 spec c m
-    local specs=() copies=() secret_args=() net_args=() env_args=()
+    local net=api replace=0 vm=0 spec c m ram
+    local specs=() copies=() secret_args=() net_args=() env_args=() box_args=()
     MOUNT_ARGS=() MOUNT_SPECS=()
     while [ $# -gt 0 ]; do
         case $1 in
             --net)      need_arg "$1" "${2:-}"; net=$2; shift 2 ;;
             --mount|-m) need_arg "$1" "${2:-}"; specs+=("$2"); shift 2 ;;
             --copy|-c)  need_arg "$1" "${2:-}"; copies+=("$2"); shift 2 ;;
+            --vm)       vm=1; shift ;;
             --replace)  replace=1; shift ;;
             *) die "up: unknown option '$1' (sbx help)" ;;
         esac
@@ -336,12 +429,19 @@ cmd_up() {
     if [ "$net" != none ]; then
         podman image exists "$IMG_EGRESS" || die "image $IMG_EGRESS is missing (sbx build egress)"
     fi
-    if exists "$CTR" || exists "$EGRESS"; then
+    if [ "$vm" = 1 ]; then
+        [ -x /usr/bin/krun ] || die "--vm needs the libkrun runtime (pkexec /usr/bin/bash host/install-krun.sh)"
+        [ -r /dev/kvm ] && [ -w /dev/kvm ] || die "--vm needs read/write access to /dev/kvm"
+        [[ $CPUS =~ ^[0-9]+$ ]] || die "--vm needs a whole number of CPUs (SBX_CPUS=$CPUS)"
+        ram=$(to_mib "$MEMORY")
+    fi
+    if session_active || exists "$CTR" || exists "$EGRESS"; then
         [ "$replace" = 1 ] || die "sandbox already exists; run sbx down first, or sbx up --replace"
     fi
     # Refuse bad copies before the old sandbox is gone.
     for c in "${copies[@]}"; do check_copy "$c" >/dev/null; done
-    if exists "$CTR" || exists "$EGRESS"; then stop_all; fi
+    if session_active || exists "$CTR" || exists "$EGRESS"; then stop_all; fi
+    rm -f "$STOPPING"   # left over if an earlier `sbx down` was killed
     # Validate mounts only now, so a running sandbox cannot swap a path
     # between the check and the mount.
     for spec in "${specs[@]}"; do add_mount "$spec"; done
@@ -366,41 +466,75 @@ cmd_up() {
             --pids-limit 256 --memory 512m \
             -e SBX_NET="$net" -e TZ="$(host_tz)" \
             "$IMG_EGRESS" >/dev/null
-        net_args=(--network "$NET_INT:ip=$SBX_IP")
+        # microVM runs may overlap, so they get addresses from the pool.
+        if [ "$vm" = 1 ]; then net_args=(--network "$NET_INT"); else net_args=(--network "$NET_INT:ip=$SBX_IP"); fi
         env_args=(-e "HTTPS_PROXY=$PROXY_URL" -e "HTTP_PROXY=$PROXY_URL"
                   -e "https_proxy=$PROXY_URL" -e "http_proxy=$PROXY_URL"
                   -e "NO_PROXY=localhost,127.0.0.1,::1" -e "no_proxy=localhost,127.0.0.1,::1")
     fi
 
-    if ! podman run -d --name "$CTR" --hostname "$CTR" \
-            "${net_args[@]}" \
-            --userns=keep-id --user 1000:1000 \
-            --cap-drop=ALL --security-opt=no-new-privileges \
-            --security-opt "seccomp=$SECCOMP" \
-            --read-only --tmpfs /tmp:rw,exec,nosuid,nodev,size=2g \
-            --pids-limit 4096 --memory "$MEMORY" --cpus "$CPUS" --shm-size 1g \
-            "${secret_args[@]}" "${env_args[@]}" \
-            -e SBX_NET="$net" -e HOME=/home/agent -e TZ="$(host_tz)" \
+    # Shared by the container and the microVM. In vm mode the confinement
+    # applies to the VMM process on the host, the guest gets its own kernel.
+    # shellcheck disable=SC2054  # the commas belong to the tmpfs options
+    box_args=(--hostname "$CTR" "${net_args[@]}"
+              --userns=keep-id --user 1000:1000
+              --cap-drop=ALL --security-opt=no-new-privileges
+              --security-opt "seccomp=$SECCOMP"
+              --read-only --tmpfs /tmp:rw,exec,nosuid,nodev,size=2g
+              --pids-limit 4096 --shm-size 1g
+              "${secret_args[@]}" "${env_args[@]}"
+              -e SBX_NET="$net" -e HOME=/home/agent -e TZ="$(host_tz)"
+              "${MOUNT_ARGS[@]}"
+              --label "sbx.net=$net")
+
+    if [ "$vm" = 1 ]; then
+        # Every run is a new container: the fixed MCS level ($VM_LEVEL) keeps
+        # the private labels (:Z) identical across runs. tini is skipped:
+        # libkrun's init is PID 1 in the guest; the entrypoint hardens the
+        # guest process with sbx-guard (SBX_VM=1).
+        box_args+=(--runtime krun --label "$VM_LABEL=1"
+                   --security-opt "label=level:$VM_LEVEL"
+                   --annotation "krun.cpus=$CPUS" --annotation "krun.ram_mib=$ram"
+                   --memory "$((ram + 1024))m" -e SBX_VM=1
+                   -v "$STATE_HOME:/home/agent:Z"
+                   -v "$LAB_IN:/lab/in:ro,Z"
+                   -v "$LAB_OUT:/lab/out:rw,Z"
+                   --entrypoint /usr/local/bin/sbx-entrypoint
+                   "$IMAGE")
+        printf '%s\0' "${box_args[@]}" > "$VM_ARGS"
+        # First run: relabels the mounts and seeds the home, proves the VM boots.
+        if ! podman run --rm "${box_args[@]}" true; then
+            rm -f "$VM_ARGS"
+            stop_all
+            die "starting the microVM failed"
+        fi
+    elif ! podman run -d --name "$CTR" "${box_args[@]}" \
+            --memory "$MEMORY" --cpus "$CPUS" \
             -v "$STATE_HOME:/home/agent:Z" \
             -v "$LAB_IN:/lab/in:ro,Z" \
             -v "$LAB_OUT:/lab/out:rw,Z" \
-            "${MOUNT_ARGS[@]}" \
-            --label "sbx.net=$net" \
             "$IMAGE" >/dev/null; then
         stop_all
         die "starting the sandbox failed"
     fi
     # Everything changed after this stamp was written by the sandbox. Set only
     # now: podman's relabelling (:z) at start also bumps the ctime of mounted
-    # files, and the agent only runs once something is exec'd into the box.
+    # files, and the agent only runs once something is exec'd or run.
     touch "$UP_STAMP"
 
-    # Remember --net/--mount (not --copy) for `sbx restart`.
+    # Remember --net/--vm/--mount (not --copy) for `sbx restart`.
     {
         printf '%s\0' --net "$net"
+        if [ "$vm" = 1 ]; then printf '%s\0' --vm; fi
         for m in "${MOUNT_SPECS[@]}"; do printf '%s\0' --mount "$m"; done
     } > "$LAST_UP"
-    note "sandbox running (net=$net). Next: sbx selftest · sbx ask \"...\" · sbx tui"
+    if [ "$vm" = 1 ]; then
+        printf 'vm %s\n' "$net" > "$MODE_FILE"
+        note "vm mode ready (net=$net): each command runs in a fresh microVM. Next: sbx selftest · sbx ask \"...\""
+    else
+        printf 'container %s\n' "$net" > "$MODE_FILE"
+        note "sandbox running (net=$net). Next: sbx selftest · sbx ask \"...\" · sbx tui"
+    fi
 }
 
 cmd_restart() {
@@ -411,18 +545,28 @@ cmd_restart() {
 }
 
 cmd_status() {
-    local c img
+    local c img spec last=()
+    if session_active; then
+        printf '%-11s %s, net=%s\n' session "$(awk '{print $1}' "$MODE_FILE")" "$(session_net)"
+    else
+        printf '%-11s %s\n' session "none (sbx up)"
+    fi
     for c in "$CTR" "$EGRESS"; do
         if exists "$c"; then
             printf '%-11s %s\n' "$c" "$(podman container inspect -f '{{.State.Status}} ({{.ImageName}})' "$c")"
-        else
+        elif ! in_vm_mode || [ "$c" != "$CTR" ]; then
             printf '%-11s %s\n' "$c" "not created"
         fi
     done
-    if exists "$CTR"; then
-        printf '%-11s %s\n' network "$(podman container inspect -f '{{index .Config.Labels "sbx.net"}}' "$CTR")"
-        echo "mounts:"
-        podman container inspect -f '{{range .Mounts}}  {{if .RW}}rw{{else}}ro{{end}}  {{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' "$CTR" | sed '/^$/d'
+    if in_vm_mode; then
+        printf '%-11s %s running\n' microVMs "$(vm_runs | wc -l)"
+    fi
+    if session_active && [ -f "$LAST_UP" ]; then
+        echo "mounts (besides state/home, lab/in ro, lab/out rw):"
+        mapfile -d '' -t last < "$LAST_UP"
+        for spec in "${last[@]}"; do
+            case $spec in /*:rw|/*:ro) printf '  %s  %s\n' "${spec##*:}" "${spec%:*}" ;; esac
+        done
     fi
     if podman secret exists "$SECRET"; then
         printf '%-11s %s\n' token "stored (podman secret $SECRET)"
@@ -440,7 +584,7 @@ cmd_status() {
 
 cmd_reset() {
     local answer
-    if exists "$CTR"; then die "stop the sandbox first (sbx down)"; fi
+    if session_active || exists "$CTR" || [ -n "$(vm_runs)" ]; then die "stop the sandbox first (sbx down)"; fi
     if [ "${1:-}" != --yes ]; then
         [ -t 0 ] || die "reset: confirm with --yes"
         read -rp "Delete the sandbox home in state/home (Claude sessions, caches)? [y/N] " answer
@@ -575,9 +719,17 @@ cmd_ask() {
     run=$RUNS/$(date +%Y%m%d-%H%M%S)-$$
     mkdir -p "$run"
     printf '%s\n' "$prompt" > "$run/prompt.txt"
-    # The prompt goes in via stdin, never via argv.
-    printf '%s' "$prompt" | podman exec -i -w "$cwd" "$CTR" sbx-claude "${args[@]}" \
-        > "$run/stream.jsonl" 2> "$run/stderr.log" || rc=$?
+    # The prompt goes in via stdin, never via argv. Piped stdin to a microVM
+    # proved unreliable, so there the run directory is mounted read-only and
+    # the prompt is read from its file.
+    if in_vm_mode; then
+        box -w "$cwd" -v "$run:/sbx-run:ro,Z" -- \
+            bash -c 'exec sbx-claude "$@" < /sbx-run/prompt.txt' sbx-claude "${args[@]}" \
+            > "$run/stream.jsonl" 2> "$run/stderr.log" || rc=$?
+    else
+        printf '%s' "$prompt" | box -i -w "$cwd" -- sbx-claude "${args[@]}" \
+            > "$run/stream.jsonl" 2> "$run/stderr.log" || rc=$?
+    fi
     if [ "$raw" = 1 ]; then sanitize < "$run/stream.jsonl"; fi
     summarize_run "$run" "$rc" | sanitize
     scan_outputs report
@@ -591,13 +743,20 @@ cmd_cat() {
     [ $# -eq 1 ] && [ -n "$f" ] || die "cat: FILE (relative to /lab/out, or absolute inside the sandbox)"
     require_running
     case $f in /*) ;; *) f=/lab/out/$f ;; esac
-    podman exec "$CTR" cat -- "$f" | sanitize
+    box -- cat -- "$f" | sanitize
 }
 
 has_tui() { podman exec "$CTR" tmux has-session -t "$TMUX_SESSION" 2>/dev/null; }
 
 cmd_tui() {
     require_running
+    if in_vm_mode; then
+        # No exec into a microVM, so no detached tmux session to drive; the
+        # interactive Claude runs in the caller's terminal instead.
+        [ -t 0 ] && [ -t 1 ] || die "vm mode: tui needs your terminal; drive the microVM with sbx ask"
+        box -i -t -w /lab -- sbx-claude "$@"
+        return
+    fi
     if has_tui; then
         note "tmux session '$TMUX_SESSION' is already running"
     else
@@ -615,11 +774,13 @@ cmd_tui() {
 cmd_screen() {
     local hist=${1:-0}
     [[ $hist =~ ^[0-9]+$ ]] || die "screen: LINES must be a number"
+    require_container_mode "sbx screen"
     require_running
     podman exec "$CTR" tmux capture-pane -p -J -t "$TMUX_SESSION" -S "-$hist" | sanitize
 }
 
 cmd_keys() {
+    require_container_mode "sbx keys"
     require_running
     case ${1:-} in
         --key)
@@ -641,11 +802,11 @@ cmd_sh() {
     require_running
     if [ "${1:-}" = -- ]; then shift; fi
     if [ $# -eq 0 ]; then
-        exec podman exec -it -w /lab "$CTR" bash -l
+        box -i -t -w /lab -- bash -l
     elif [ -t 0 ] && [ -t 1 ]; then
-        exec podman exec -it -w /lab "$CTR" "$@"
+        box -i -t -w /lab -- "$@"
     else
-        exec podman exec -i -w /lab "$CTR" "$@"
+        box -i -w /lab -- "$@"
     fi
 }
 
@@ -679,9 +840,9 @@ proxy_udp_out() {
 check_dns_leak() {
     local before after
     before=$(proxy_udp_out)
-    podman exec "$CTR" curl -s -o /dev/null --max-time 10 "https://sbx-leak-$RANDOM$RANDOM.example.com/" || true
-    podman exec "$CTR" curl -s -o /dev/null --max-time 10 "http://sbx-leak-$RANDOM$RANDOM.example.com/" || true
-    podman exec "$CTR" curl -s -o /dev/null --max-time 10 "https://203.0.113.7/" || true
+    box -- curl -s -o /dev/null --max-time 10 "https://sbx-leak-$RANDOM$RANDOM.example.com/" || true
+    box -- curl -s -o /dev/null --max-time 10 "http://sbx-leak-$RANDOM$RANDOM.example.com/" || true
+    box -- curl -s -o /dev/null --max-time 10 "https://203.0.113.7/" || true
     after=$(proxy_udp_out)
     if [ -n "$before" ] && [ "$before" = "$after" ]; then
         echo "PASS  proxy refuses other names without a DNS lookup"
@@ -691,8 +852,40 @@ check_dns_leak() {
     return 1
 }
 
+# vm mode: the guest must run its own kernel, and the VMM process on the host
+# must keep the container confinement (it is what the guest's devices reach).
+check_vm_boundary() {
+    local saved=() guest host pid st label rc=0 vmm=claude-sbx-vmcheck
+    host=$(uname -r)
+    guest=$(box -- uname -r 2>/dev/null) || guest=""
+    if [ -n "$guest" ] && [ "$guest" != "$host" ]; then
+        echo "PASS  guest runs its own kernel ($guest, host $host)"
+    else
+        echo "FAIL  guest kernel '${guest:-?}' is not distinct from the host's"; rc=1
+    fi
+    mapfile -d '' -t saved < "$VM_ARGS"
+    podman rm -f -t 0 --ignore "$vmm" >/dev/null 2>&1
+    podman run -d --rm --name "$vmm" "${saved[@]}" sleep 20 >/dev/null || { echo "FAIL  could not start a microVM"; return 1; }
+    pid=$(podman inspect -f '{{.State.Pid}}' "$vmm" 2>/dev/null) || pid=""
+    st=/proc/${pid:-0}/status
+    if [ -n "$pid" ] && [ -r "$st" ]; then
+        if grep -Eq '^CapEff:[[:space:]]+0+$' "$st"; then echo "PASS  VMM has no capabilities"; else echo "FAIL  VMM has capabilities"; rc=$((rc + 1)); fi
+        if grep -Eq '^NoNewPrivs:[[:space:]]+1$' "$st"; then echo "PASS  VMM has no_new_privs"; else echo "FAIL  VMM lacks no_new_privs"; rc=$((rc + 1)); fi
+        if grep -Eq '^Seccomp:[[:space:]]+2$' "$st"; then echo "PASS  VMM runs under seccomp"; else echo "FAIL  VMM runs without seccomp"; rc=$((rc + 1)); fi
+        label=$(tr -d '\0' < "/proc/$pid/attr/current" 2>/dev/null) || label=""
+        case $label in
+            *:container_kvm_t:"$VM_LEVEL") echo "PASS  VMM SELinux domain $label" ;;
+            *) echo "FAIL  VMM SELinux domain '${label:-unknown}' (expected container_kvm_t:$VM_LEVEL)"; rc=$((rc + 1)) ;;
+        esac
+    else
+        echo "FAIL  could not inspect the VMM process"; rc=$((rc + 1))
+    fi
+    podman rm -f -t 0 --ignore "$vmm" >/dev/null 2>&1
+    return "$rc"
+}
+
 cmd_selftest() {
-    local args=() gw ip rc=0
+    local args=() saved=() gw ip i opts spec rc=0
     require_running
     # Host-side addresses that must stay unreachable: LAN gateway, host IPs,
     # cloud metadata, the internal network's gateway.
@@ -702,11 +895,21 @@ cmd_selftest() {
         args+=(--probe "${ip%/*}")
     done < <(ip -4 -o addr show scope global | awk '{print $4}')
     args+=(--probe 169.254.169.254 --probe "$GATEWAY" --absent "$HOME" --absent "/run/user/$(id -u)")
-    podman exec "$CTR" sbx-selftest "${args[@]}" | sanitize || rc=$?
-    if [ "$(podman container inspect -f '{{index .Config.Labels "sbx.net"}}' "$CTR")" = api ]; then
-        echo "== host-side checks"
-        check_dns_leak || rc=$((rc + 1))
+    if in_vm_mode; then
+        # The guest sees one virtio-fs tree, not individual mounts: tell it
+        # which paths must refuse writes.
+        mapfile -d '' -t saved < "$VM_ARGS"
+        for ((i = 0; i < ${#saved[@]} - 1; i++)); do
+            [ "${saved[i]}" = -v ] || continue
+            opts=${saved[i + 1]##*:}
+            spec=${saved[i + 1]%:*}   # SRC:DST
+            case ",$opts," in *,ro,*) args+=(--expect-ro "${spec#*:}") ;; esac
+        done
     fi
+    box -- sbx-selftest "${args[@]}" | sanitize || rc=$?
+    echo "== host-side checks"
+    if [ "$(session_net)" = api ]; then check_dns_leak || rc=$((rc + 1)); fi
+    if in_vm_mode; then check_vm_boundary || rc=$((rc + $?)); fi
     return "$rc"
 }
 
@@ -740,7 +943,8 @@ main() {
         ask)      cmd_ask "$@" ;;
         cat)      cmd_cat "$@" ;;
         tui)      cmd_tui "$@" ;;
-        attach)   require_running; exec podman exec -it "$CTR" tmux attach -t "$TMUX_SESSION" ;;
+        attach)   require_container_mode "sbx attach"; require_running
+                  exec podman exec -it "$CTR" tmux attach -t "$TMUX_SESSION" ;;
         screen)   cmd_screen "$@" ;;
         keys)     cmd_keys "$@" ;;
         sh|exec)  cmd_sh "$@" ;;

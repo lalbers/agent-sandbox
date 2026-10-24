@@ -2,6 +2,8 @@
 # Isolation checks inside the running sandbox; started by `sbx selftest`.
 #   --probe IP     host-side address (LAN gateway, host IPs, ...) that must stay unreachable
 #   --absent PATH  host path that must not exist in here
+#   --expect-ro P  path that must refuse writes (vm mode: the guest sees one
+#                  virtio-fs tree, so the host names the read-only mounts)
 # Prints PASS/FAIL/INFO lines; the exit status is the number of failures.
 set -uo pipefail
 
@@ -12,11 +14,12 @@ info() { printf 'INFO  %s\n' "$*"; }
 expect_ok()   { local d=$1; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else fail "$d"; fi; }
 expect_fail() { local d=$1; shift; if "$@" >/dev/null 2>&1; then fail "$d"; else pass "$d"; fi; }
 
-probes=() absent=()
+probes=() absent=() expect_ro=()
 while [ $# -gt 0 ]; do
     case $1 in
-        --probe)  probes+=("$2"); shift 2 ;;
-        --absent) absent+=("$2"); shift 2 ;;
+        --probe)     probes+=("$2"); shift 2 ;;
+        --absent)    absent+=("$2"); shift 2 ;;
+        --expect-ro) expect_ro+=("$2"); shift 2 ;;
         *) echo "sbx-selftest: unknown argument $1" >&2; exit 64 ;;
     esac
 done
@@ -34,17 +37,24 @@ proxy_denied() {
 
 echo "== confinement"
 expect_ok "runs as non-root (uid $(id -u))" test "$(id -u)" -ne 0
-expect_ok "no effective capabilities" grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status
+if [ -n "${SBX_VM:-}" ]; then
+    # The guest kernel enforces nothing of the container's confinement by
+    # itself; sbx-guard (run by the entrypoint) sets no_new_privs and seccomp.
+    # Capabilities and SELinux of the VMM are checked by sbx from the host.
+    info "microVM guest, kernel $(uname -r)"
+else
+    expect_ok "no effective capabilities" grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status
+    label=$(tr -d '\0' < /proc/self/attr/current 2>/dev/null)
+    case $label in
+        *:container_t:*) pass "SELinux domain $label" ;;
+        *) fail "SELinux domain '${label:-unknown}' (expected container_t)" ;;
+    esac
+fi
 expect_ok "no_new_privs is set" grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
 expect_ok "seccomp filter is active" grep -Eq '^Seccomp:[[:space:]]+2$' /proc/self/status
-label=$(tr -d '\0' < /proc/self/attr/current 2>/dev/null)
-case $label in
-    *:container_t:*) pass "SELinux domain $label" ;;
-    *) fail "SELinux domain '${label:-unknown}' (expected container_t)" ;;
-esac
-# New namespaces (above all user namespaces, i.e. in-container "root") are
-# refused by the seccomp profile, via unshare(2) as well as clone(2); clone3
-# must return ENOSYS because seccomp cannot inspect its flags.
+# New namespaces (above all user namespaces, i.e. in-sandbox "root") are
+# refused via unshare(2) as well as clone(2); clone3 must return ENOSYS
+# because seccomp cannot inspect its flags.
 expect_fail "no user namespace via unshare(2)" python3 -c 'import os; os.unshare(os.CLONE_NEWUSER)'
 expect_fail "no user namespace via clone(2)" python3 -c '
 import ctypes, os, sys
@@ -56,6 +66,8 @@ expect_ok "clone3 refused with ENOSYS" python3 -c '
 import ctypes, sys
 libc = ctypes.CDLL(None, use_errno=True)
 sys.exit(0 if libc.syscall(435, 0, 0) == -1 and ctypes.get_errno() == 38 else 1)'
+suid=$(find / -xdev -type f -perm /6000 -print -quit 2>/dev/null)
+if [ -z "$suid" ]; then pass "no setuid/setgid binaries"; else fail "setuid/setgid binary present: $suid"; fi
 expect_fail "root filesystem is read-only" touch /usr/.sbx-selftest
 expect_ok "home is writable" bash -c ': > "$HOME/.sbx-selftest" && rm -f "$HOME/.sbx-selftest"'
 
@@ -93,7 +105,9 @@ if [ "$mode" = api ] || [ "$mode" = open ]; then
         if [ "$c" = 403 ]; then pass "proxy refuses CONNECT $target:443"; else fail "proxy does not refuse CONNECT $target:443 ($c)"; fi
     done
 else
-    expect_fail "no network interface except loopback" bash -c 'ip -o link show | grep -v " lo:" | grep -q .'
+    # A microVM guest always has TSI's dummy0; its sockets go to the VMM's
+    # network namespace, which has only loopback here (the probes above).
+    expect_fail "no network interface except loopback" bash -c 'ip -o link show | grep -vE " (lo|dummy0):" | grep -q .'
 fi
 
 echo "== mounts"
@@ -102,12 +116,24 @@ while read -r _ _ _ _ mnt opts _; do
     case $mnt in /lab/*|/host/*) ;; *) continue ;; esac
     case ",$opts," in *,ro,*) m=ro ;; *) m=rw ;; esac
     info "$m $mnt"
+    # In the microVM the flags shown here are the guest's; read-only is
+    # enforced by the VMM on the host, which the --expect-ro writes test.
+    [ -z "${SBX_VM:-}" ] || continue
     case $mnt in
         /lab/in|*/.git)
             if [ "$m" = ro ]; then pass "$mnt is read-only"; else fail "$mnt should be read-only"; fi ;;
     esac
     if [ "$m" = ro ]; then expect_fail "write refused on $mnt" touch "$mnt/.sbx-selftest"; fi
 done < /proc/self/mountinfo
+for p in "${expect_ro[@]}"; do
+    if [ -d "$p" ]; then
+        expect_fail "write refused in $p" touch "$p/.sbx-selftest"
+    elif [ -e "$p" ]; then
+        expect_fail "write refused on $p" bash -c ': >> "$1"' _ "$p"
+    else
+        fail "expected read-only path missing: $p"
+    fi
+done
 
 echo "== tools"
 for cmd in "claude --version" "node --version" "rea --version" "java -version" "chromium-browser --version"; do

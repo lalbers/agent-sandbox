@@ -38,13 +38,21 @@ RUN useradd -m -u 1000 -U -s /bin/bash agent \
     && mkdir -p /lab/in /lab/out /host /opt/claude-sbx/skel/.claude \
     && chown -R agent:agent /lab /opt/claude-sbx/skel
 
-COPY container/sbx-entrypoint container/sbx-claude container/sbx-selftest /usr/local/bin/
+COPY container/sbx-entrypoint container/sbx-claude container/sbx-selftest container/sbx-guard /usr/local/bin/
 COPY container/managed-settings.json container/CLAUDE.md /etc/claude-code/
 COPY container/mcp.json /etc/claude-sbx/mcp.json
 COPY container/tmux.conf /etc/tmux.conf
 COPY container/claude.json /opt/claude-sbx/claude.json
 RUN chmod 0755 /usr/local/bin/sbx-entrypoint /usr/local/bin/sbx-claude /usr/local/bin/sbx-selftest \
+        /usr/local/bin/sbx-guard \
     && echo "claude-code=${CLAUDE_CODE_VERSION}" > /opt/claude-sbx/skel/.sbx-skel-version
+
+# No setuid/setgid binaries and no file capabilities: nothing in the sandbox
+# may gain privileges by exec (matters in the microVM guest, whose kernel does
+# not enforce the container's no_new_privs before sbx-guard runs).
+RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
+    && find / -xdev -type f -perm /111 -print0 | xargs -0 getcap 2>/dev/null \
+        | awk '{print $1}' | xargs -r setcap -r
 
 LABEL org.opencontainers.image.title="claude-sbx-base" \
       sbx.claude-code.version="${CLAUDE_CODE_VERSION}"

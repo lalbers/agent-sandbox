@@ -13,4 +13,9 @@ cp -R "$skel/." "$HOME/"
 # Claude's own state file is only seeded once; Claude rewrites it at runtime.
 [ -f "$HOME/.claude.json" ] || cp /opt/claude-sbx/claude.json "$HOME/.claude.json"
 
+# In a microVM the guest kernel does not apply the container's confinement;
+# sbx-guard sets no_new_privs and a seccomp filter before the command runs.
+if [ -n "${SBX_VM:-}" ]; then
+    exec /usr/local/bin/sbx-guard "$@"
+fi
 exec "$@"

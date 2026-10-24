@@ -1,0 +1,106 @@
+#!/usr/bin/python3 -I
+"""sbx-guard CMD [ARGS...]: harden this process, then exec CMD.
+
+Used inside the microVM (vm mode). The guest kernel has none of the
+container's confinement: libkrun's init starts the workload with a full
+bounding set, without no_new_privs and without seccomp, and the guest can
+create user namespaces. Before running anything, this sets no_new_privs and
+loads a seccomp filter that refuses new namespaces (no user-namespace "root"),
+the x32 ABI and kernel interfaces that are frequent privilege-escalation
+vectors. Both survive exec and cannot be undone by the workload.
+"""
+import ctypes
+import os
+import struct
+import sys
+
+PR_SET_NO_NEW_PRIVS = 38
+PR_SET_SECCOMP = 22
+SECCOMP_MODE_FILTER = 2
+AUDIT_ARCH_X86_64 = 0xC000003E
+RET_ALLOW = 0x7FFF0000
+RET_KILL_PROCESS = 0x80000000
+EPERM, ENOSYS = 1, 38
+# CLONE_NEWNS | NEWCGROUP | NEWUTS | NEWIPC | NEWUSER | NEWPID | NEWNET
+NS_FLAGS = 0x7E020000
+X32_SYSCALL_BIT = 0x40000000
+
+CLONE, UNSHARE = 56, 272
+DENY = {  # x86_64 syscall number: errno
+    308: EPERM,   # setns
+    435: ENOSYS,  # clone3: flags not inspectable, libc falls back to clone
+    321: EPERM,   # bpf
+    298: EPERM,   # perf_event_open
+    323: EPERM,   # userfaultfd
+    248: EPERM,   # add_key
+    249: EPERM,   # request_key
+    250: EPERM,   # keyctl
+    425: ENOSYS,  # io_uring_setup: callers fall back to plain syscalls
+    426: ENOSYS,  # io_uring_enter
+    427: ENOSYS,  # io_uring_register
+    165: EPERM,   # mount
+    166: EPERM,   # umount2
+    155: EPERM,   # pivot_root
+    428: EPERM,   # open_tree
+    429: EPERM,   # move_mount
+    430: EPERM,   # fsopen
+    431: EPERM,   # fsconfig
+    432: EPERM,   # fsmount
+    433: EPERM,   # fspick
+    442: EPERM,   # mount_setattr
+}
+
+# Classic BPF opcodes.
+LD_ABS, JEQ, JGE, JSET, RET = 0x20, 0x15, 0x35, 0x45, 0x06
+
+
+def build_filter():
+    prog = []
+
+    def ins(code, k=0, jt=0, jf=0):
+        prog.append([code, jt, jf, k])
+
+    ins(LD_ABS, 4)                                 # seccomp_data.arch
+    ins(JEQ, AUDIT_ARCH_X86_64, jt=1)
+    ins(RET, RET_KILL_PROCESS)
+    ins(LD_ABS, 0)                                 # seccomp_data.nr
+    ins(JGE, X32_SYSCALL_BIT, jf=1)
+    ins(RET, 0x00050000 | EPERM)
+    ns_jumps = []
+    for nr in (CLONE, UNSHARE):
+        ns_jumps.append(len(prog))
+        ins(JEQ, nr)                               # jt patched below
+    for nr, err in DENY.items():
+        ins(JEQ, nr, jf=1)
+        ins(RET, 0x00050000 | err)
+    ins(RET, RET_ALLOW)
+    ns_check = len(prog)
+    ins(LD_ABS, 16)                                # low word of args[0] (flags)
+    ins(JSET, NS_FLAGS, jf=1)
+    ins(RET, 0x00050000 | EPERM)
+    ins(RET, RET_ALLOW)
+    for i in ns_jumps:
+        prog[i][1] = ns_check - (i + 1)
+    return prog
+
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit("usage: sbx-guard CMD [ARGS...]")
+    prog = build_filter()
+    buf = ctypes.create_string_buffer(b"".join(struct.pack("HBBI", *f) for f in prog))
+    fprog = SockFprog(len(prog), ctypes.addressof(buf))
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        sys.exit(f"sbx-guard: no_new_privs failed: {os.strerror(ctypes.get_errno())}")
+    if libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(fprog), 0, 0) != 0:
+        sys.exit(f"sbx-guard: seccomp failed: {os.strerror(ctypes.get_errno())}")
+    os.execvp(sys.argv[1], sys.argv[1:])
+
+
+if __name__ == "__main__":
+    main()
