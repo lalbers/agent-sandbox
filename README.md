@@ -183,15 +183,20 @@ safe again. Ideally drive the lab from a host session without connectors.
   read. `state/` and `lab/` get private categories instead.
 - **Router WAN IP.** In `open` mode the proxy refuses private addresses, but
   your router's public IP is public: hairpin NAT could expose port forwards.
-- **Build-time supply chain.** Claude Code, REA, mitmproxy, Ghidra and the JDK
-  are pinned (the latter three by SHA-256), but npm and pip resolve transitive
+- **Build-time supply chain.** Node.js, Claude Code, REA, mitmproxy, Ghidra
+  and the JDK are pinned (Node.js, mitmproxy, Ghidra and the JDK by SHA-256;
+  the Node.js hash comes from the release-key-signed `SHASUMS256.txt`, checked
+  when the pin was set), but npm and pip resolve transitive
   dependencies at build time. npm install scripts run in the build container,
   which has unfiltered network; pip only takes prebuilt wheels. Pinned versions also age: updates are deliberate (edit
   `versions.env`, `sbx build`).
 
 ## Updating
 
-Edit `versions.env` (REA, Claude Code, mitmproxy wheel hash, Ghidra/JDK URL +
-SHA-256), then `sbx build` (add `--no-cache --pull` to refresh the Fedora
-packages) and `sbx restart`. The microVM runtime comes from Fedora and updates
-with the system.
+Edit `versions.env` (Node.js version + SHA-256, REA, Claude Code, mitmproxy
+wheel hash, Ghidra/JDK URL + SHA-256; check REA's changelog for new Node or
+Ghidra requirements first), then `sbx build` (add `--no-cache --pull` to refresh the Fedora
+packages) and `sbx restart`. Node.js (with its bundled OpenSSL, libuv and
+others) is not a Fedora package: its security releases need a
+`NODE_VERSION`/`NODE_SHA256` bump. The microVM runtime comes from Fedora and
+updates with the system.

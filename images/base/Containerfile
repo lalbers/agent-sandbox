@@ -11,6 +11,8 @@ ARG FEDORA_IMAGE=registry.fedoraproject.org/fedora:44
 FROM ${FEDORA_IMAGE}
 
 ARG CLAUDE_CODE_VERSION
+ARG NODE_VERSION
+ARG NODE_SHA256
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
@@ -24,8 +26,19 @@ RUN dnf -y update && dnf -y install --setopt=install_weak_deps=False \
         bash tini tmux less which findutils procps-ng iproute \
         git jq ripgrep file binutils vim-common \
         tar gzip xz unzip curl ca-certificates python3 \
-        nodejs24 nodejs24-npm \
     && dnf clean all && rm -rf /var/cache/dnf
+
+# Node.js from nodejs.org, checksum-verified, into /usr/local (so npm's global
+# prefix, and with it `claude` and `rea`, is /usr/local as well).
+RUN curl -fsSL -o /tmp/node.tar.xz \
+        "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+    && echo "$NODE_SHA256  /tmp/node.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
+        --exclude="node-v${NODE_VERSION}-linux-x64/CHANGELOG.md" \
+        --exclude="node-v${NODE_VERSION}-linux-x64/README.md" \
+        --exclude="node-v${NODE_VERSION}-linux-x64/LICENSE" \
+    && rm /tmp/node.tar.xz \
+    && node --version && npm --version
 
 # Claude Code from npm, pinned. npm checks every tarball against the registry's
 # integrity hash; the postinstall step links the native linux-x64 binary.
@@ -55,7 +68,8 @@ RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
         | awk '{print $1}' | xargs -r setcap -r
 
 LABEL org.opencontainers.image.title="claude-sbx-base" \
-      sbx.claude-code.version="${CLAUDE_CODE_VERSION}"
+      sbx.claude-code.version="${CLAUDE_CODE_VERSION}" \
+      sbx.node.version="${NODE_VERSION}"
 
 USER agent
 WORKDIR /lab

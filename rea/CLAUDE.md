@@ -26,4 +26,5 @@
   policy still applies, and point the target at it:
   `"$REA_MITMDUMP_COMMAND" --listen-host 127.0.0.1 -p 8080
   --mode "upstream:$HTTPS_PROXY" -w /lab/out/session.mitm`
-  (its CA is created in `~/.mitmproxy`).
+  (its CA is created in `~/.mitmproxy`; Node.js targets only trust it with
+  `NODE_EXTRA_CA_CERTS=~/.mitmproxy/mitmproxy-ca-cert.pem`).
