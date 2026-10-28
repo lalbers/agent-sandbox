@@ -3,6 +3,9 @@
 # (setup-token, no claude.ai connectors) with REA, in rootless Podman behind an
 # egress proxy. `sbx help` lists the commands; README.md explains the model.
 set -euo pipefail
+# Without this, bash runs command substitutions without errexit, and a policy
+# check that fails inside $(...) could look like "no objection".
+shopt -s inherit_errexit
 
 SBX_ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 
@@ -265,7 +268,7 @@ resolve_path() {
 
 check_shareable() {
     local why
-    why=$(deny_reason "$1")
+    why=$(deny_reason "$1") || die "refusing $1: the path policy could not be evaluated"
     [ -z "$why" ] || die "refusing $1: $why"
 }
 
@@ -1108,6 +1111,9 @@ main() {
     local cmd=${1:-help} p
     [ "$(id -u)" -ne 0 ] || die "refusing to run as root: rootless podman is the isolation boundary"
     if [ $# -gt 0 ]; then shift; fi
+    # Commands that share host paths load the policy here, in the main shell,
+    # so a broken config stops them before any check runs.
+    case $cmd in up|restart|check|in) load_policy ;; esac
     case $cmd in
         build)    cmd_build "$@" ;;
         up)       cmd_up "$@" ;;
