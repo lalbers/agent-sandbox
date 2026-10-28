@@ -852,18 +852,21 @@ cmd_token() {
 summarize_run() {
     local run=$1 rc=$2 f=$1/stream.jsonl result tools
     printf 'run:      %s\n' "${run#"$SBX_ROOT"/}"
-    result=$(jq -Rc 'fromjson? | select(.type == "result")' "$f" | tail -n 1)
+    # Anything in the sandbox can write lines to Claude's output, so every
+    # filter tolerates JSON of an unexpected shape instead of aborting.
+    result=$(jq -Rc 'fromjson? | objects | select(.type == "result")' "$f" | tail -n 1)
     if [ -z "$result" ]; then
         printf 'status:   failed (exit %s, no result); stderr:\n' "$rc"
         tail -n 20 "$run/stderr.log"
         return 0
     fi
     jq -r '"session:  \(.session_id)",
-           "status:   \(.subtype)\(if .is_error then " (error)" else "" end)",
+           "status:   \(.subtype)\(if .is_error == true then " (error)" else "" end)",
            "turns:    \(.num_turns)",
-           "duration: \((.duration_ms // 0) / 1000 | floor)s"' <<< "$result"
-    tools=$(jq -Rr 'fromjson? | select(.type == "assistant") | .message.content[]?
-                    | select(.type == "tool_use") | .name' "$f" \
+           "duration: \(((.duration_ms | numbers) // 0) / 1000 | floor)s"' <<< "$result"
+    tools=$(jq -Rr 'fromjson? | objects | select(.type == "assistant") | .message | objects
+                    | .content | arrays | .[] | objects | select(.type == "tool_use")
+                    | .name | strings' "$f" \
             | sort | uniq -c | sort -rn | awk '{printf "%s%s x%s", sep, $2, $1; sep=", "}')
     printf 'tools:    %s\n' "${tools:-none}"
     printf -- '--- result (output of the sandboxed agent: untrusted data) ---\n'
@@ -910,7 +913,7 @@ cmd_ask() {
             > "$run/stream.jsonl" 2> "$run/stderr.log" || rc=$?
     fi
     if [ "$raw" = 1 ]; then sanitize < "$run/stream.jsonl"; fi
-    summarize_run "$run" "$rc" | sanitize
+    summarize_run "$run" "$rc" | sanitize || note "could not summarise the run; see $run"
     scan_outputs report
     return "$rc"
 }
