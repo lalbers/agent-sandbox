@@ -1,202 +1,219 @@
-# claude-sandbox — isolated Claude Code + REA in rootless Podman
+# agent-sandbox
 
-A disposable lab for running [REA](https://github.com/morluto/rea) (an MCP server
-for reverse engineering) together with Claude Code **without** giving either of
-them access to the Fedora host: no host home, no SSH keys, no Claude
-credentials or claude.ai connectors, no LAN. The host CLI `sbx` starts the lab,
-mounts or copies selected host paths into it, and drives the Claude inside —
-by hand or from a Claude Code session on the host.
+Run an AI coding agent and its tool servers on a Linux workstation without
+letting either of them touch the host.
 
-Why not just install REA on the host: REA runs as an MCP server, and Claude
-Code starts MCP servers *outside* its Bash sandbox with full user rights. REA
-itself states it is "not a sandbox" (Ghidra parses untrusted binaries, runtime
-capture executes targets), `rea setup` edits agent configuration, and every
-analysed string or web page is a prompt-injection vector for an agent that
-would otherwise see `~/.ssh` and the connectors.
+The concrete case is [REA](https://github.com/morluto/rea), an MCP server for
+reverse engineering, driven by Claude Code. That combination is a good stress
+test. REA parses untrusted binaries with Ghidra and can execute targets under
+Frida, and every string it extracts lands in the agent's context. Claude
+Code's own Bash sandbox does not help here, because it does not cover MCP
+servers: they run with your full user rights. On an ordinary workstation the
+agent could then reach `~/.ssh`, your Claude login with its claude.ai
+connectors, and the LAN.
 
-## Layout
+This lab puts Claude Code and REA into rootless Podman, optionally with a
+libkrun microVM per command. It lets them reach the model API and nothing
+else, and it checks its own isolation. A small host CLI, `sbx`, starts the lab,
+moves files in and out under a mount policy and drives the agent inside, by
+hand or from a Claude Code session on the host.
+
+Status: a personal lab, tested on Fedora 44 (x86_64) with rootless Podman 5
+and SELinux enforcing. Versions are pinned and updated by hand.
+
+## Architecture
 
 ```
-Fedora host (rootless Podman, SELinux enforcing)
+host (rootless Podman, SELinux enforcing)
 │
-├─ you / a host Claude session ──► bin/sbx ──► podman exec / run
+├─ you, or a Claude Code session on the host ──► bin/sbx
 │
-│  ┌─ network sbx-int (--internal, no DNS, no default route) ────────┐
-│  │  claude-sbx    Fedora 44, user "agent" (UID 1000 = you via keep-id)
-│  │                container, or with --vm a libkrun microVM per command
-│  │   ├ Claude Code (pinned), auth: setup-token as podman secret     │
-│  │   ├ REA MCP server (pinned) + Ghidra 12.1 + JDK 21 + Chromium    │
-│  │   │  + Frida, PTY capture, mitmdump 12.2.3                       │
-│  │   └ /lab/in (ro) · /lab/out (rw) · /host/<path> (your mounts)    │
-│  │                    │ HTTP(S)_PROXY                               │
-│  │  sbx-egress (squid) ┴── network sbx-ext ──► internet (by mode)   │
-│  └──────────────────────────────────────────────────────────────────┘
+│  ┌─ network sbx-int: --internal, no DNS, no default route ───────────┐
+│  │                                                                     │
+│  │  claude-sbx   container, or one libkrun microVM per command (--vm) │
+│  │   ├ Claude Code (setup-token auth, bypassPermissions)               │
+│  │   ├ REA MCP server, Ghidra 12.1, JDK 21, Chromium, Frida, mitmdump  │
+│  │   └ /lab/in (ro) · /lab/out (rw) · /host/<path> (your mounts)       │
+│  │                   │ HTTP(S)_PROXY                                   │
+│  │  sbx-egress ──────┘ squid ── network sbx-ext ──► internet           │
+│  └─────────────────────────────────────────────────────────────────────┘
 ```
 
 | Layer | What it does |
 | --- | --- |
-| Auth | `claude setup-token` token (1 year). It can only make model requests: no claude.ai connectors, no Remote Control. Stored as podman secret, injected as `CLAUDE_CODE_OAUTH_TOKEN`. `disableClaudeAiConnectors` is set as well. |
-| Container | Rootless, `--cap-drop=ALL`, `no-new-privileges`, SELinux `container_t`, read-only root fs, memory/CPU/PID limits, no host sockets (Wayland, D-Bus, Podman, ssh-agent), no setuid/setgid binaries or file capabilities in the images. Seccomp: Podman's default profile minus new namespaces (`state/seccomp.json`, regenerated on `sbx up`), so no in-container user namespace "root". In vm mode the guest is hardened separately (see below). |
-| Claude | Runs with `bypassPermissions` — deliberately: the container is the boundary. Only the image's MCP config is loaded (`--strict-mcp-config`). Output shown on the host is stripped of control characters (no terminal escapes). |
-| Network | The sandbox has no route and no DNS; everything goes through the squid proxy. `api`: only `api.anthropic.com`, other names are refused without even resolving them (no DNS side channel). `open`: public internet. Both refuse private, loopback, link-local (metadata), multicast and NAT64 addresses — LAN and host stay unreachable. |
-| Mounts | Read-only by default, only below `SBX_MOUNT_ROOTS` (default `~/Git:~/Downloads`), never hidden entries in `$HOME`, the home itself, this repo and personal directories (redacted for publication). In rw mounts every existing `.git` (nested repos too) is mounted read-only. Anything else: `--copy` into `lab/in`. |
-| Outputs | `sbx down` first stops the sandbox, then removes symlinks and special files from `lab/out` (host tools would follow them to host files), renames any `.git`/`.envrc` there to `*.sbx-quarantine-<time>` (a git-aware prompt or direnv would run them on `cd`), and lists new `.git`, `.envrc` and symlinks in rw mounts. `sbx ask` only reports these, because the sandbox keeps running. While it runs, read results with `sbx cat` (read inside the container), not from the host. |
+| Credentials | Claude Code authenticates with a token from `claude setup-token`. It can only make model requests: no claude.ai connectors, no Remote Control. It is stored as a Podman secret and never mounted or passed on the command line. `disableClaudeAiConnectors` is set as well. |
+| Container | Rootless, user namespace mapped to your UID, no capabilities, `no_new_privs`, SELinux `container_t`, read-only root filesystem, CPU, memory and PID limits, no host sockets (Wayland, D-Bus, Podman, ssh-agent). The images contain no setuid/setgid binaries and no file capabilities. Seccomp: Podman's default profile without new namespaces, regenerated on every `sbx up`. |
+| Agent | Claude Code runs with `bypassPermissions`. I made that choice on purpose: the container is the boundary, not a permission prompt inside it. Only the image's MCP configuration is loaded (`--strict-mcp-config`). |
+| Network | The sandbox has no route and no DNS. Everything goes through a squid proxy. In `api` mode it allows only `api.anthropic.com` and refuses every other name *before* resolving it. In `open` mode it allows the public internet. Both modes refuse private, loopback, link-local (cloud metadata), multicast and NAT64 addresses, so the LAN and the host stay out of reach. `none` gives no network at all. |
+| Mounts | Read-only by default, only below configured roots, never your home directory as a whole or any hidden entry in it. Every existing `.git` inside a writable mount is mounted read-only. Anything else can only be copied in. |
+| Outputs | `sbx down` stops the sandbox first and then checks what it left behind. In `lab/out` it removes symlinks and special files and renames `.git` and `.envrc`. In writable mounts it lists new `.git`, `.envrc` and symlinks. Text that comes back from the agent has its control characters stripped. |
 
 ## Quick start
 
+Requirements: rootless Podman 5, SELinux enforcing, `jq`, a Claude Pro or Max
+subscription. For `--vm`, also `/dev/kvm` and the libkrun runtime
+(`pkexec /usr/bin/bash host/install-krun.sh`; `--dry-run` shows the
+transaction).
+
 ```bash
-ln -s ~/Git/claude-sandbox/bin/sbx ~/.local/bin/sbx   # once
-sbx build                         # base, rea and egress images (pinned in versions.env)
-claude setup-token                # on the host, browser login; prints the token
-sbx token set                     # paste it (stored as podman secret, not in this repo)
-sbx up --copy ~/Downloads/some.AppImage
-sbx selftest                      # isolation checks inside the sandbox
-sbx ask "Analyse /lab/in/some.AppImage with REA. Write findings to /lab/out/report.md"
+ln -s "$PWD/bin/sbx" ~/.local/bin/sbx    # once
+sbx build                                # base, rea and egress images
+claude setup-token                       # on the host; prints the token
+sbx token set                            # paste it
+sbx up --copy ~/Downloads/some-binary
+sbx selftest
+sbx ask "Analyse /lab/in/some-binary with REA. Write a report to /lab/out/report.md"
+sbx cat report.md
 sbx down
 ```
 
-Interactive: `sbx tui`, then `sbx attach` (detach with `Ctrl-b d`).
-
-For anything that *executes* the target, use the microVM mode (see below):
-`sbx up --vm --copy ~/Downloads/some.bin`, then the same `sbx ask`/`sbx selftest`.
-
-`sbx sh -- rea doctor --json` shows REA's readiness. Expected gaps: Hopper,
-IDA, JADX and Kuna are not installed (commercial or caller-supplied); Ghidra
-is the analysis provider. The doctor also reports the missing Claude
-registration in `~/.claude.json` — intended, Claude only loads
-`/etc/claude-sbx/mcp.json`.
+`sbx up --vm` runs the same workflow with a microVM per command. Use it for
+anything that executes the target. `sbx tui` starts an interactive Claude in
+tmux; `sbx attach` connects your terminal to it.
 
 ## Commands
 
-`sbx help` prints the full list. The important ones:
+`sbx help` prints the full list.
 
 | Command | Purpose |
 | --- | --- |
-| `sbx up [--net api\|open\|none] [--vm] [--mount PATH[:ro\|:rw]]... [--copy PATH]...` | Start proxy + sandbox (`--vm`: microVM mode, see below). Mounts are fixed per session; change them with `sbx up --replace ...`. |
-| `sbx restart` | Recreate with the last `--net`/`--vm`/`--mount` options (e.g. after `sbx token set`). |
-| `sbx in PATH...` | Copy more inputs into `/lab/in` while running. |
-| `sbx check PATH[:rw]...` | Dry-run the mount policy. |
-| `sbx cat FILE` | Print a result (relative to `/lab/out`), read inside the sandbox: safe while it runs. |
-| `sbx ask [--resume ID\|--continue] PROMPT` | Headless run (`claude -p`, stream-json). Prints session id, tools used and the result; the full transcript lands in `runs/<timestamp>/`. |
-| `sbx tui` / `attach` / `screen` / `keys` | Interactive Claude in tmux inside the sandbox; `screen` and `keys` let a host session read and type (container mode; in vm mode `tui` runs in your terminal). |
-| `sbx sh [-- CMD]` | Shell or command inside, e.g. `sbx sh -- rea doctor --json`. |
-| `sbx egress [-f]` | Every destination the sandbox asked the proxy for (saved to `logs/` on `sbx down`). |
-| `sbx selftest` | Confinement, namespace, host-data, network and mount checks from inside, plus host-side checks: the proxy does no DNS for refused names (api mode); the guest kernel and the VMM's confinement (vm mode). |
-| `sbx reset` | Wipe `state/home` (Claude sessions, caches). |
+| `sbx up [--net api\|open\|none] [--vm] [--mount PATH[:ro\|:rw]]... [--copy PATH]...` | Start the proxy and the sandbox. Mounts are fixed per session; `sbx up --replace` changes them. |
+| `sbx restart` | Recreate with the last `--net`, `--vm` and `--mount` options, e.g. after `sbx token set`. |
+| `sbx in PATH...` / `sbx check PATH[:rw]...` | Copy more inputs into `/lab/in`; dry-run the mount policy. |
+| `sbx ask [--resume ID\|--continue] PROMPT` | Headless run (`claude -p`). Prints the session ID, the tools used and the result; the full transcript goes to `runs/`. |
+| `sbx cat FILE` | Print a result. The file is read inside the sandbox, so a planted symlink cannot point it at a host file. |
+| `sbx tui` / `attach` / `screen` / `keys` | Interactive Claude in tmux. `screen` and `keys` let a host session read and type (container mode). |
+| `sbx sh [-- CMD]` | A shell or command inside, e.g. `sbx sh -- rea doctor --json`. |
+| `sbx egress [-f]` | Every destination the sandbox asked the proxy for. |
+| `sbx selftest` | Isolation checks from inside, plus host-side checks of the proxy's DNS behaviour and, in vm mode, of the VMM process. |
+| `sbx down` / `sbx reset` | Stop the session and check its outputs; wipe the sandbox home. |
 
-## Directories
+## microVM mode
 
-| Path | Content |
-| --- | --- |
-| `images/{base,rea,egress}/Containerfile` | Images; `versions.env` pins the direct versions and checksums. |
-| `container/` | Files baked into the base image (entrypoint, `sbx-claude`, `sbx-selftest`, `sbx-guard` for the microVM guest, managed settings, sandbox CLAUDE.md, tmux.conf). |
-| `rea/` | REA layer: MCP config and CLAUDE.md addendum. |
-| `egress/` | Squid policy (`common.conf`, `api.conf`, `open.conf`, `allow-api.txt`). |
-| `state/home` | Persistent home of the sandbox user; `state/` also holds the seccomp profile, the session mode, the microVM run settings and restart/scan stamps (git-ignored). |
-| `host/install-krun.sh` | Installs the libkrun runtime (`crun-krun`) for vm mode; root via `pkexec`, `--dry-run` shows the transaction. |
-| `lab/in`, `lab/out` | Inputs (ro inside) and results (git-ignored). |
-| `runs/`, `logs/` | `sbx ask` transcripts, proxy logs (git-ignored). |
+Frida, process capture and Chromium work in both modes without extra
+privileges (no `SYS_PTRACE`, no relaxed seccomp). They execute the target,
+though, and in container mode that code shares the host kernel. `sbx up --vm`
+runs every command in a fresh [libkrun](https://github.com/containers/libkrun)
+microVM instead:
 
-## Runtime analysis and microVM mode
+- The workload runs on its own guest kernel on KVM. libkrun's guest init
+  applies none of the container's restrictions. `sbx-guard` therefore sets
+  `no_new_privs` inside the guest before every command and loads a seccomp
+  filter. The filter blocks new namespaces, the x32 ABI, bpf, perf events,
+  userfaultfd, keyrings, io_uring and the mount syscalls.
+- The VMM process on the host keeps the full container confinement: no
+  capabilities, `no_new_privs`, the seccomp profile, SELinux `container_kvm_t`
+  with its own MCS categories, the internal network namespace and only the
+  chosen mounts. Guest sockets are proxied into that namespace, so the egress
+  policy applies unchanged.
+- A microVM cannot be `exec`'d into. Each `sbx ask`, `sh`, `cat` and
+  `selftest` therefore starts a new one (about 0.4 s). Claude sessions persist
+  in `state/home`, so `--resume` works across them. The prompt is handed over
+  as a read-only file, because piped stdin into a microVM proved unreliable.
 
-Frida (`rea instrument-with-frida`), process capture (`rea capture-process`)
-and Chromium for browser observation work in both modes **without extra
-privileges**: no `SYS_PTRACE`, no relaxed seccomp. mitmdump 12.2.3 is
-installed for REA's `.mitm` decoding (`REA_MITMDUMP_COMMAND`); for a live
-capture it runs inside the sandbox chained to the egress proxy
-(`--mode upstream:$HTTPS_PROXY`), so the network policy still applies.
+## Findings
 
-These tools *execute* the target. In container mode that code shares the host
-kernel. `sbx up --vm` runs every command in a fresh
-[libkrun](https://github.com/containers/libkrun) microVM instead:
+These are the things I learned while building it. Each one turned into code
+or a check in `sbx selftest`.
 
-- **What the guest adds.** The workload runs on its own kernel (from
-  `libkrunfw`) on KVM. libkrun's guest init applies none of the container's
-  confinement, so `sbx-guard` does it inside the guest before every command:
-  `no_new_privs` and a seccomp filter against new namespaces, the x32 ABI,
-  bpf, perf events, userfaultfd, keyrings, io_uring and mount syscalls (a
-  denylist of these interfaces, not the container's full allowlist). With
-  no setuid binaries in the image, the sandbox user cannot become root in
-  the guest without a guest-kernel exploit.
-- **What still protects the host.** The VMM process keeps the full container
-  confinement: rootless user namespace, no capabilities, `no_new_privs`, the
-  seccomp profile, SELinux `container_kvm_t` with its own MCS categories, the
-  `sbx-int` network namespace (guest sockets are proxied there, so the egress
-  policy applies unchanged) and only the mounts you chose. This matters: guest
-  *root* can reach the VMM (libkrun exposes the VMM's own `/proc` to the guest
-  via virtio-fs), so the microVM is an extra hurdle — a guest-kernel exploit
-  first — in front of the container-grade boundary, not a second independent
-  one. `sbx selftest` checks the guest hardening and the VMM from the host.
-- **Setup.** `pkexec /usr/bin/bash host/install-krun.sh` (installs `crun-krun`,
-  `libkrun`, `libkrunfw`), and `/dev/kvm`. `SBX_CPUS` sets the vCPUs,
-  `SBX_MEMORY` the guest RAM (the VMM's cgroup gets 1 GiB on top).
-- **How it differs.** A microVM cannot be `exec`'d into, so each `sbx ask`,
-  `sbx sh`, `sbx cat` and `sbx selftest` starts a new microVM (about 0.4 s).
-  Claude sessions persist in `state/home`, so `--resume` works across them.
-  `sbx tui` runs Claude in your own terminal — unfiltered, so the guest can
-  send escape sequences to it; `attach`/`screen`/`keys` are container-only.
-  Piped stdin to a microVM proved unreliable, so `sbx ask` hands the prompt
-  over as a read-only file. If `sbx` is interrupted or terminated, it removes
-  its microVM; only a `SIGKILL` can leave one running until `sbx down`.
-- **What it does not change.** The guest reaches the host only through the
-  VMM's devices — your mounts (virtio-fs) and the proxied network — so the
-  mount policy, `lab/out` handling and egress modes matter as much as before.
+- **Tool servers are the weak spot.** Claude Code's Bash sandbox covers shell
+  commands, not MCP servers, hooks or other helper processes. A powerful MCP
+  server needs its own boundary.
+- **Scope the credential, not just the process.** A `setup-token` can only
+  make model requests. If it leaks, the attacker gets inference on your
+  subscription, but not your connected Gmail, calendar or drives.
+- **A proxy can leak through DNS.** In the first version, squid evaluated the
+  "no private destinations" rule (a `dst` ACL) before the allowlist. That rule
+  makes squid resolve every requested hostname, so `secret.attacker.example`
+  reached the attacker's nameserver even in "API only" mode. The selftest now
+  compares the proxy's UDP counters before and after requests for random
+  names.
+- **Podman's default seccomp profile allows user namespaces.** It allows
+  `unshare` and `clone` with `CLONE_NEWUSER` so that nested containers work,
+  and that gives the agent "root" in a namespace, with a much larger kernel
+  attack surface. `sbx` derives a profile without new namespaces, the same
+  thing Docker's default profile does.
+- **A microVM is not automatically a second boundary.** libkrun has no
+  `exec`, its guest init sets neither `no_new_privs` nor seccomp, and the
+  VMM's own `/proc` is visible in the guest through virtio-fs. Guest root
+  could use that to reach the VMM. The VM adds a guest-kernel exploit in front
+  of the container-grade boundary, but the two do not combine into
+  independent layers.
+- **Outputs are a way back in.** A symlink in the results folder makes host
+  tools read host files. A `.git` with hooks or `core.fsmonitor`, or an
+  `.envrc`, in a writable mount runs code the next time you `cd` there with a
+  git-aware prompt. Escape sequences in the agent's answer reach your terminal.
+  `sbx` stops the sandbox before it inspects the outputs, so a background
+  process cannot plant files after the check.
+- **Relabelling changes ctime.** Podman's `:z`/`:Z` relabel bumps the inode
+  ctime of every mounted file. That broke change detection based on ctime
+  until the stamp was set after the start, and the microVM runs got a fixed
+  MCS level.
 
-## Driving it from a Claude Code session on the host
+## Limits
 
-Claude Code's own Bash sandbox cannot run rootless Podman, so every `sbx` call
-from a host session has to leave that sandbox (approved per call), or you
-allow it permanently in `~/.claude/settings.json`:
+- **Container mode shares the host kernel.** A kernel exploit escapes as your
+  user. That is fine for static analysis. For running hostile code, use `--vm`.
+- **vm mode** moves the attack surface to KVM and libkrun's device emulation in
+  a confined process; see the findings above. Keep `crun-krun`, `libkrun` and
+  `libkrunfw` updated.
+- **Writable mounts are the real way out.** `sbx` reports new `.git`, `.envrc`
+  and symlinks there but cannot judge scripts or Makefiles the agent changed.
+  Prefer `lab/out`.
+- **`api` mode means "api.anthropic.com only", not "your account only".** The
+  endpoint also accepts someone else's API key, so code planted by a
+  prompt-injected agent could upload data, including the token, to a different
+  Anthropic organisation. In `open` mode anything can leave. Revoke the token
+  if in doubt.
+- **SELinux labels stay.** Mounted host paths are relabelled to
+  `container_file_t` and keep that label after `sbx down`. Do not mount paths
+  that confined system services read.
+- **Build-time supply chain.** Node.js, Claude Code, REA, mitmproxy, Ghidra and
+  the JDK are pinned (Node.js, mitmproxy, Ghidra and the JDK by SHA-256). npm
+  and pip still resolve transitive dependencies at build time, and npm install
+  scripts run in the build container with unfiltered network.
 
-```json
-{ "sandbox": { "excludedCommands": ["sbx *"] } }
-```
+## Configuration
 
-Treat everything `sbx ask`/`sbx screen`/`sbx cat` returns as untrusted data:
-it comes from an agent that just read the analysed material. While the sandbox
-runs, read results with `sbx cat`, not with host tools on `lab/out` (a symlink
-planted there would make them read host files); `sbx down` makes `lab/out`
-safe again. Ideally drive the lab from a host session without connectors.
+Personal settings live outside the repository in `~/.config/agent-sandbox/`
+(see `config/*.example`):
 
-## Residual risks
+- `mount-roots`: directories below which paths may be mounted. The default is
+  `~/Downloads`.
+- `deny-paths`: extra host paths that are never mounted or copied.
 
-- **Shared kernel (container mode).** A kernel exploit escapes as your user.
-  Fine for static analysis; for *executing* hostile samples use `--vm`.
-- **microVM (vm mode).** An attacker first needs a guest-kernel exploit to get
-  guest root; from there the VMM (a confined user process, see above) is
-  reachable, so the remaining boundary is the container-grade one plus KVM and
-  libkrun's device emulation. Keep `crun-krun`, `libkrun` and `libkrunfw`
-  updated with the system (`dnf upgrade`).
-- **rw mounts are the real exit.** Scripts, Makefiles, `.envrc`, a newly
-  created `.git` (hooks, `core.fsmonitor` — run by any `git status`, including
-  shell-prompt integrations) and the like run later on the host. `sbx` only
-  *reports* new `.git`/`.envrc`/symlinks; read that warning. Prefer `lab/out`.
-- **`api` mode is "api.anthropic.com only", not "your account only".** The
-  endpoint also accepts someone else's API key, so prompt-injected code could
-  upload data — including the setup-token — into a foreign Anthropic
-  organisation. In `open` mode anything can leave. The token is valid for a year
-  on your subscription; revoke it if you suspect it leaked.
-- **SELinux labels stay.** Mounted host paths are relabelled (`:z`,
-  `container_file_t` without MCS categories, i.e. readable by any container
-  that escapes its own confinement) and keep that label after `sbx down`.
-  Harmless for your own tools, but do not mount paths that confined services
-  read. `state/` and `lab/` get private categories instead.
-- **Router WAN IP.** In `open` mode the proxy refuses private addresses, but
-  your router's public IP is public: hairpin NAT could expose port forwards.
-- **Build-time supply chain.** Node.js, Claude Code, REA, mitmproxy, Ghidra
-  and the JDK are pinned (Node.js, mitmproxy, Ghidra and the JDK by SHA-256;
-  the Node.js hash comes from the release-key-signed `SHASUMS256.txt`, checked
-  when the pin was set), but npm and pip resolve transitive
-  dependencies at build time. npm install scripts run in the build container,
-  which has unfiltered network; pip only takes prebuilt wheels. Pinned versions also age: updates are deliberate (edit
-  `versions.env`, `sbx build`).
+`versions.env` pins every version. To update one, check REA's changelog for new
+Node.js or Ghidra requirements, edit the file, run `sbx build` and then
+`sbx restart`. Node.js is not a Fedora package here, so its security releases
+need a pin bump. Environment overrides: `SBX_MEMORY` (default `8g`),
+`SBX_CPUS` (`4`), `SBX_IMAGE`, `SBX_MOUNT_ROOTS`, `SBX_CONFIG_DIR`.
 
-## Updating
+Driving the lab from a Claude Code session on the host needs every `sbx` call
+to run outside that session's own sandbox, because rootless Podman does not
+work inside it. Treat everything `sbx ask`, `sbx screen` and `sbx cat` return
+as untrusted data. It comes from an agent that has just read the material
+under analysis.
 
-Edit `versions.env` (Node.js version + SHA-256, REA, Claude Code, mitmproxy
-wheel hash, Ghidra/JDK URL + SHA-256; check REA's changelog for new Node or
-Ghidra requirements first), then `sbx build` (add `--no-cache --pull` to refresh the Fedora
-packages) and `sbx restart`. Node.js (with its bundled OpenSSL, libuv and
-others) is not a Fedora package: its security releases need a
-`NODE_VERSION`/`NODE_SHA256` bump. The microVM runtime comes from Fedora and
-updates with the system.
+## How this was built
+
+I built this from 23 to 25 October 2026 in a private repository and imported
+it here once it had settled; this history starts with that import. I set the
+goal and the requirements, chose between the options that came up and made the
+security trade-offs, such as `bypassPermissions` behind the container boundary
+and the two-phase plan with a microVM mode. Claude Code (Claude Opus) wrote
+most of the code and documentation in sessions I steered. After each phase,
+separate Claude agents reviewed the result with instructions to break it, and
+they ran live tests. Most of the findings above came out of those reviews.
+Commits name Claude as co-author where it wrote the content.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The images install third-party software at build
+time: Claude Code (Anthropic's terms; needs your own subscription), REA (MIT),
+Ghidra (Apache-2.0), Eclipse Temurin (GPLv2 with Classpath Exception),
+mitmproxy (MIT), Node.js (MIT), Chromium, squid and Fedora packages under their
+own licenses. This repository contains none of them, and no images are
+published.
+
+This is not affiliated with Anthropic or the REA project. Only analyse
+software you are allowed to analyse.

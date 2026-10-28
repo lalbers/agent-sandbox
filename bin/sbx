@@ -25,9 +25,12 @@ IMAGE=${SBX_IMAGE:-$IMG_REA}
 MEMORY=${SBX_MEMORY:-8g}
 CPUS=${SBX_CPUS:-4}
 
-# Host directories below which paths may be bind-mounted (and therefore
-# SELinux-relabelled). Anything else can only be copied into lab/in.
-MOUNT_ROOTS=${SBX_MOUNT_ROOTS:-$HOME/Git:$HOME/Downloads}
+# Personal settings live outside the repository:
+#   mount-roots  directories below which paths may be bind-mounted (and
+#                therefore SELinux-relabelled); default ~/Downloads
+#   deny-paths   extra host paths that are never mounted or copied
+# One path per line, `#` starts a comment, a leading ~/ means $HOME.
+SBX_CONFIG_DIR=${SBX_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-sandbox}
 
 STATE_HOME=$SBX_ROOT/state/home
 LAST_UP=$SBX_ROOT/state/last-up
@@ -87,9 +90,12 @@ Inspection
 Networks: api = Anthropic API only (default), open = internet but never LAN or
 host, none = no network (Claude cannot run, `sbx sh` still works).
 Mounts are read-only unless :rw, appear under /host/<path>, and are limited to
-SBX_MOUNT_ROOTS (default ~/Git:~/Downloads). Existing .git dirs in rw mounts
-stay ro; new .git/.envrc/symlinks there are reported by `sbx ask` and `sbx down`.
-Environment: SBX_IMAGE, SBX_MEMORY (8g), SBX_CPUS (4), SBX_MOUNT_ROOTS.
+the mount roots (~/.config/agent-sandbox/mount-roots, default ~/Downloads).
+Existing .git dirs in rw mounts stay ro; new .git/.envrc/symlinks there are
+reported by `sbx ask` and `sbx down`. Extra protected paths:
+~/.config/agent-sandbox/deny-paths.
+Environment: SBX_IMAGE, SBX_MEMORY (8g), SBX_CPUS (4), SBX_MOUNT_ROOTS (overrides
+mount-roots, colon-separated), SBX_CONFIG_DIR.
 EOF
 }
 
@@ -181,6 +187,29 @@ sanitize() {
 
 # ---------------------------------------------------------------- path policy
 
+# read_list FILE: the paths in a config file, one per line, without comments
+# and blank lines; a leading ~/ becomes $HOME.
+read_list() {
+    local line
+    [ -f "$1" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%%#*}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        [ -n "$line" ] || continue
+        case $line in "~") line=$HOME ;; "~/"*) line=$HOME/${line#"~/"} ;; esac
+        printf '%s\n' "$line"
+    done < "$1"
+}
+
+if [ -n "${SBX_MOUNT_ROOTS:-}" ]; then
+    MOUNT_ROOTS=$SBX_MOUNT_ROOTS
+else
+    MOUNT_ROOTS=$(read_list "$SBX_CONFIG_DIR/mount-roots" | paste -sd: -)
+    MOUNT_ROOTS=${MOUNT_ROOTS:-$HOME/Downloads}
+fi
+mapfile -t EXTRA_DENY < <(read_list "$SBX_CONFIG_DIR/deny-paths")
+
 # is_within PATH DIR: PATH is DIR or lies below it.
 is_within() { [ "$1" = "$2" ] || [ "$2" = / ] || [[ $1 == "$2"/* ]]; }
 
@@ -189,8 +218,7 @@ deny_reason() {
     local p=$1 d
     if is_within "$HOME" "$p"; then echo "contains your whole home directory"; return; fi
     if [[ $p == "$HOME"/.* ]]; then echo "hidden entry in \$HOME (credentials and configuration)"; return; fi
-    # (personal deny-paths redacted for publication)
-    for d in /proc /sys /dev /run /var/run /boot "$SBX_ROOT"; do
+    for d in /proc /sys /dev /run /var/run /boot "$SBX_ROOT" "${EXTRA_DENY[@]}"; do
         d=$(realpath -m -- "$d")
         if is_within "$p" "$d"; then echo "inside protected path $d"; return; fi
         if is_within "$d" "$p"; then echo "contains protected path $d"; return; fi

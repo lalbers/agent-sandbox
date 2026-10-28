@@ -1,0 +1,6 @@
+# Copy to ~/.config/agent-sandbox/mount-roots and adapt.
+# `sbx up --mount PATH` accepts only paths below one of these directories
+# (they get an SELinux relabel). Everything else can only be copied in with
+# --copy or `sbx in`. Without this file the only root is ~/Downloads.
+~/Downloads
+~/src

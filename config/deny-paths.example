@@ -1,0 +1,8 @@
+# Copy to ~/.config/agent-sandbox/deny-paths and adapt.
+# Host paths that are never mounted or copied into the sandbox, in addition to
+# the built-in rules (your home directory as a whole, every hidden entry
+# directly in it, /proc, /sys, /dev, /run, /boot and this repository).
+# A path is refused if it lies inside one of these or contains one of them.
+~/Documents/private
+~/sync
+/mnt/backup
