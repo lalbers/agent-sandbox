@@ -196,7 +196,7 @@ sanitize() {
 read_list() {
     local line
     [ -e "$1" ] || return 0
-    [ -r "$1" ] || die "cannot read $1"
+    [ -f "$1" ] && [ -r "$1" ] || die "cannot read $1"
     while IFS= read -r line || [ -n "$line" ]; do
         line=${line#"${line%%[![:space:]]*}"}
         line=${line%"${line##*[![:space:]]}"}
@@ -214,28 +214,38 @@ is_within() { [ "$1" = "$2" ] || [ "$2" = / ] || [[ $1 == "$2"/* ]]; }
 # Canonical home: paths are compared after resolving symlinks, so must $HOME be.
 HOME_REAL=$(realpath -e -- "$HOME") || die "cannot resolve \$HOME"
 
-if [ -n "${SBX_MOUNT_ROOTS:-}" ]; then
-    MOUNT_ROOTS=$SBX_MOUNT_ROOTS
-else
-    MOUNT_ROOTS=$(read_list "$SBX_CONFIG_DIR/mount-roots" | paste -sd: -)
-    MOUNT_ROOTS=${MOUNT_ROOTS:-$HOME/Downloads}
-fi
+# load_policy: read the mount roots and extra deny paths, once. Only commands
+# that share host paths need them, so a broken config never blocks `sbx down`.
+POLICY_LOADED=0
+MOUNT_ROOTS=""
 EXTRA_DENY=()
-deny_list=$(read_list "$SBX_CONFIG_DIR/deny-paths")
-if [ -n "$deny_list" ]; then mapfile -t EXTRA_DENY <<< "$deny_list"; fi
-unset deny_list
+load_policy() {
+    local deny_list
+    [ "$POLICY_LOADED" = 0 ] || return 0
+    if [ -n "${SBX_MOUNT_ROOTS:-}" ]; then
+        MOUNT_ROOTS=$SBX_MOUNT_ROOTS
+    else
+        MOUNT_ROOTS=$(read_list "$SBX_CONFIG_DIR/mount-roots" | paste -sd: -) || exit 1
+        MOUNT_ROOTS=${MOUNT_ROOTS:-$HOME/Downloads}
+    fi
+    deny_list=$(read_list "$SBX_CONFIG_DIR/deny-paths") || exit 1
+    if [ -n "$deny_list" ]; then mapfile -t EXTRA_DENY <<< "$deny_list"; fi
+    POLICY_LOADED=1
+}
 
-# Env overrides change the policy; say so whenever a command applies it.
+# Env overrides change the policy or the image; say so whenever they apply.
 warn_overrides() {
     if [ -n "${SBX_MOUNT_ROOTS:-}" ]; then note "mount roots from SBX_MOUNT_ROOTS: $SBX_MOUNT_ROOTS"; fi
     if [ "$SBX_CONFIG_DIR" != "${XDG_CONFIG_HOME:-$HOME/.config}/agent-sandbox" ]; then
         note "config from SBX_CONFIG_DIR: $SBX_CONFIG_DIR"
     fi
+    if [ "$IMAGE" != "$IMG_REA" ]; then note "image from SBX_IMAGE: $IMAGE"; fi
 }
 
 # Print why PATH must never be shared with the sandbox; print nothing if it may.
 deny_reason() {
     local p=$1 d
+    load_policy
     if is_within "$HOME_REAL" "$p"; then echo "contains your whole home directory"; return; fi
     if [[ $p == "$HOME_REAL"/.* ]]; then echo "hidden entry in \$HOME (credentials and configuration)"; return; fi
     for d in /proc /sys /dev /run /var/run /boot "$SBX_ROOT" "$SBX_CONFIG_DIR" "${EXTRA_DENY[@]}"; do
@@ -264,9 +274,11 @@ check_shareable() {
 # this repository or the config directory. Missing roots are skipped.
 in_mount_roots() {
     local root r roots=()
+    load_policy
     IFS=: read -ra roots <<< "$MOUNT_ROOTS"
     for root in "${roots[@]}"; do
         [ -n "$root" ] || continue
+        [[ $root == /* ]] || die "mount root $root is not an absolute path"
         r=$(realpath -e -- "$root" 2>/dev/null) || continue
         if [ "$r" = / ] || is_within "$HOME_REAL" "$r" || [[ $r == "$HOME_REAL"/.* ]] \
             || is_within "$r" "$SBX_ROOT" || is_within "$r" "$(realpath -m -- "$SBX_CONFIG_DIR")"; then
@@ -297,25 +309,31 @@ check_relabel_safe() {
 
 # Names that make host tools run or load something when you work in that
 # directory later: git (hooks, core.fsmonitor), direnv, Claude Code project
-# settings, hooks and memory, MCP configs, editor tasks, pre-commit.
-RISKY_NAMES=(.git .envrc .claude .mcp.json CLAUDE.md .husky .vscode .idea .devcontainer .pre-commit-config.yaml)
+# settings, hooks and memory, MCP configs, editor tasks, pre-commit, package
+# manager and toolchain configuration that can name commands to run.
+RISKY_NAMES=(.git .envrc .claude .mcp.json CLAUDE.md CLAUDE.local.md .husky .vscode .idea
+             .devcontainer .pre-commit-config.yaml .github .npmrc .yarnrc .yarnrc.yml
+             .cargo .mvn mise.toml .mise.toml)
 RISKY_FIND=()
 for n in "${RISKY_NAMES[@]}"; do RISKY_FIND+=(-o -name "$n"); done
 RISKY_FIND=("(" "${RISKY_FIND[@]:1}" ")")
 unset n
 
-# risky_entries DIR: NUL-separated paths below DIR that host tools would act
-# on: entries named in RISKY_NAMES, and git repositories under any name (a
-# directory holding HEAD, objects/ and refs/: git uses it as a bare repo).
-# Nested hits inside an earlier hit are left out.
+# is_git_dir DIR: git would use DIR as a repository (bare or worktree-style
+# gitdir: it only needs a HEAD file, or a commondir file pointing elsewhere).
+is_git_dir() { [ -f "$1/HEAD" ] || [ -f "$1/commondir" ]; }
+
+# risky_entries DIR: NUL-separated paths in DIR that host tools would act on:
+# entries named in RISKY_NAMES and git directories under any name. If DIR
+# itself is a git directory, its HEAD and commondir files are listed, since
+# DIR itself cannot be moved. Nested hits inside an earlier hit are left out.
 risky_entries() {
     local f a skip acc=()
     {
         find "$1" -xdev -mindepth 1 "${RISKY_FIND[@]}" -prune -print0 2>/dev/null
         while IFS= read -r -d '' f; do
-            f=${f%/HEAD}
-            if [ -d "$f/objects" ] && [ -d "$f/refs" ] && [ "$f" != "$1" ]; then printf '%s\0' "$f"; fi
-        done < <(find "$1" -xdev -mindepth 2 -type f -name HEAD -print0 2>/dev/null)
+            if [ "${f%/*}" = "$1" ]; then printf '%s\0' "$f"; else printf '%s\0' "${f%/*}"; fi
+        done < <(find "$1" -xdev -mindepth 1 -type f \( -name HEAD -o -name commondir \) -print0 2>/dev/null)
     } | sort -zu | while IFS= read -r -d '' f; do
         skip=0
         for a in "${acc[@]}"; do
@@ -340,7 +358,9 @@ add_mount() {
     check_shareable "$p"
     in_mount_roots "$p" || die "refusing $p: only paths below ${MOUNT_ROOTS//:/, } can be mounted; use --copy"
     if [ "$mode" = rw ]; then
-        case "$p/" in */.git/*) die "refusing $p: rw mounts inside git metadata are not allowed" ;; esac
+        if is_risky_path "$p" || is_git_dir "$p"; then
+            die "refusing $p: rw mounts of or inside git metadata or tool configuration are not allowed"
+        fi
     fi
     check_relabel_safe "$p"
     dst=/host$p
@@ -376,9 +396,11 @@ check_copy() {
     src=$(resolve_path "$1") || exit 1
     check_shareable "$src"
     # A running sandbox could swap parts of a path in its rw mounts between
-    # this check and the copy.
+    # this check and the copy, in either direction of nesting.
     while IFS= read -r m; do
-        if is_within "$src" "$m"; then die "refusing $src: inside an rw mount of the running sandbox (sbx down first)"; fi
+        if is_within "$src" "$m" || is_within "$m" "$src"; then
+            die "refusing $src: overlaps an rw mount of the running sandbox (sbx down first)"
+        fi
     done < <(session_rw_mounts)
     name=$(basename -- "$src")
     [ ! -e "$LAB_IN/$name" ] || die "lab/in/$name already exists; remove it there first"
@@ -451,7 +473,8 @@ scan_outputs() {
         while IFS= read -r src; do
             while IFS= read -r -d '' f; do
                 n=$((n + 1))
-                if [ -L "$f" ] || is_risky_path "${f#"$src"}"; then
+                if [ -L "$f" ] || is_risky_path "${f#"$src"}" \
+                    || [ "${f##*/}" = HEAD ] || [ "${f##*/}" = commondir ]; then
                     hits+=("rw mount: RISKY new/changed: ${f//$'\n'/\\n}")
                 else
                     changed+=("${f//$'\n'/\\n}")
@@ -469,7 +492,7 @@ scan_outputs() {
     elif [ ${#changed[@]} -gt 0 ]; then
         mkdir -p "$LOGS"
         f=$LOGS/changes-$(date +%Y%m%d-%H%M%S).txt
-        printf '%s\n' "${changed[@]}" > "$f"
+        printf '%s\n' "${changed[@]}" | sanitize > "$f"
         hits+=("rw mounts: $n file(s) changed by the sandbox, ${#changed[@]} of them ordinary; list in ${f#"$SBX_ROOT"/}")
     fi
     [ ${#hits[@]} -gt 0 ] || return 0
@@ -570,6 +593,9 @@ cmd_up() {
     done
     case $net in api|open|none) ;; *) die "--net must be api, open or none" ;; esac
     warn_overrides
+    if command -v git >/dev/null && [ "$(git config --global --get safe.bareRepository 2>/dev/null)" != explicit ]; then
+        note "tip: git config --global safe.bareRepository explicit (then git never treats a planted directory as a repository)"
+    fi
     podman image exists "$IMAGE" || die "image $IMAGE is missing (sbx build)"
     if [ "$net" != none ]; then
         podman image exists "$IMG_EGRESS" || die "image $IMG_EGRESS is missing (sbx build egress)"
@@ -651,13 +677,14 @@ cmd_up() {
                    --entrypoint /usr/local/bin/sbx-entrypoint
                    "$IMAGE")
         printf '%s\0' "${box_args[@]}" > "$VM_ARGS"
-        # First run: relabels the mounts and seeds the home, proves the VM boots.
-        if ! podman run --rm "${box_args[@]}" true; then
+        # First run: relabels the mounts, resets the home, proves the VM boots.
+        # Later runs must not reset the home: they may overlap.
+        if ! podman run --rm -e SBX_RESET_HOME=1 "${box_args[@]}" true; then
             rm -f "$VM_ARGS"
             stop_all
             die "starting the microVM failed"
         fi
-    elif ! podman run -d --name "$CTR" "${box_args[@]}" \
+    elif ! podman run -d --name "$CTR" -e SBX_RESET_HOME=1 "${box_args[@]}" \
             --memory "$MEMORY" --cpus "$CPUS" \
             -v "$STATE_HOME:/home/agent:Z" \
             -v "$LAB_IN:/lab/in:ro,Z" \
@@ -736,7 +763,7 @@ cmd_reset() {
     if session_active || exists "$CTR" || [ -n "$(vm_runs)" ]; then die "stop the sandbox first (sbx down)"; fi
     if [ "${1:-}" != --yes ]; then
         [ -t 0 ] || die "reset: confirm with --yes"
-        read -rp "Delete the sandbox home in state/home (Claude sessions, caches)? [y/N] " answer
+        read -rp "Delete the stored Claude session transcripts in state/home? [y/N] " answer
         [[ $answer == [yY]* ]] || die "aborted"
     fi
     # `podman unshare` so that files owned by other container UIDs go too.
@@ -1088,7 +1115,7 @@ main() {
         down)     stop_all; note "sandbox stopped" ;;
         status)   cmd_status ;;
         reset)    cmd_reset "$@" ;;
-        in)       [ $# -gt 0 ] || die "in: PATH..."; for p in "$@"; do copy_in "$p"; done ;;
+        in)       [ $# -gt 0 ] || die "in: PATH..."; warn_overrides; for p in "$@"; do copy_in "$p"; done ;;
         check)    cmd_check "$@" ;;
         ask)      cmd_ask "$@" ;;
         cat)      cmd_cat "$@" ;;

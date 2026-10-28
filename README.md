@@ -1,7 +1,7 @@
 # agent-sandbox
 
 Run an AI coding agent and its tool servers on a Linux workstation without
-letting either of them touch the host.
+letting either of them reach more of the host than you hand over.
 
 The concrete case is [REA](https://github.com/morluto/rea), an MCP server for
 reverse engineering, driven by Claude Code. The combination is a good stress
@@ -52,12 +52,12 @@ host (rootless Podman, SELinux enforcing)
 
 | Layer | What it does |
 | --- | --- |
-| Credentials | Claude Code authenticates with a token from `claude setup-token`, which can only make model requests: no claude.ai connectors, no Remote Control. It is stored as a Podman secret and reaches the sandbox only as an environment variable of the agent, never in a mount or on a command line. The agent can read it (see Limits); REA and the targets it runs do not get it. |
-| Container | Rootless, user namespace mapped to your UID, no capabilities, `no_new_privs`, SELinux `container_t`, read-only root filesystem, CPU, memory and PID limits, no host sockets (Wayland, D-Bus, Podman, ssh-agent). The images contain no setuid/setgid binaries and no file capabilities. Seccomp: Podman's default profile without new namespaces and keyring calls, regenerated on every `sbx up` and used for the proxy too. |
-| Agent | Claude Code runs with `bypassPermissions`. That is deliberate: the container is the boundary. Only the image's MCP configuration is loaded (`--strict-mcp-config`), only the image's hooks may run, and in `api` mode WebFetch and WebSearch are off. The agent's home is reset on every start, keeping only conversation transcripts, so one session cannot leave settings, hooks or instructions for the next. |
+| Credentials | Claude Code authenticates with a `claude setup-token` token, which can only make model requests (no claude.ai connectors, no Remote Control). It is a Podman secret, injected only into the agent's environment. REA starts without it, but any process running as the sandbox user can read it from `/proc` (see Limits). |
+| Container | Rootless (your UID mapped to the sandbox user), no capabilities, `no_new_privs`, SELinux `container_t`, read-only root, CPU/memory/PID limits, no host sockets (Wayland, D-Bus, Podman, ssh-agent). No setuid/setgid binaries or file capabilities. Seccomp: Podman's default minus new namespaces and keyring calls, also applied to the proxy. |
+| Agent | Claude Code runs with `bypassPermissions`. That is deliberate: the container is the boundary. Only the image's MCP configuration and hooks are loaded, and in `api` mode WebFetch and WebSearch are off. At the start of every session the agent's home is reset to the image, keeping only conversation transcripts, so one session cannot leave settings or hooks for the next; `--resume` and `--continue` still replay a stored transcript. |
 | Network | No route and no DNS inside; everything goes through squid. `api` mode allows only `api.anthropic.com` and refuses every other name *before* resolving it. `open` mode allows public destinations on ports 80 and 443. Both refuse private, loopback, link-local (cloud metadata), multicast and NAT64 addresses. `none` gives no network at all: Claude cannot run, `sbx sh` still works. |
-| Mounts | Read-only by default, only below configured roots, never your home as a whole or a hidden entry in it. In a writable mount, existing `.git`, `.claude`, `.envrc`, `.mcp.json`, `CLAUDE.md`, editor and pre-commit configuration, and bare git repositories are mounted read-only. Anything else can only be copied in. |
-| Outputs | `sbx down` stops the sandbox first and then checks what it left behind. In `lab/out` it deletes symlinks and special files and moves risky entries such as `.git` to `state/quarantine` with all permissions removed. For writable mounts it lists every file the sandbox changed and flags the risky ones. Text that comes back from the agent has control and bidi characters stripped. |
+| Mounts | Read-only by default, only below configured roots, never your home as a whole or a hidden entry in it. In a writable mount, known risky entries stay read-only: `.git` and other git directories, `.claude`, `CLAUDE.md`, `.mcp.json`, `.envrc`, editor, pre-commit, package-manager and toolchain configuration. Such a path itself cannot be mounted writable. Paths outside the roots can only be copied in. |
+| Outputs | `sbx down` stops the sandbox first and then checks what it left behind. In `lab/out` it deletes symlinks and special files and moves risky entries to `state/quarantine` with all permissions removed. For writable mounts it lists every file the sandbox changed and flags the risky ones. Text that comes back from the agent has control and bidi characters stripped. |
 
 ## Findings
 
@@ -96,7 +96,9 @@ What building this taught me. Each item became code or a `sbx selftest` check.
   background process cannot plant files after the check.
 - **A persistent agent home is a persistence mechanism.** Hooks, `CLAUDE.md`,
   skills or a poisoned npm cache left by one session would run in the next one,
-  possibly with more network or mounts. Only the transcripts survive now.
+  possibly with more network or mounts. Only the transcripts survive now; they
+  can still carry planted turns, so resume a session only into the same or a
+  tighter configuration.
 - **Relabelling changes ctime.** Podman's `:z`/`:Z` relabel bumps the ctime of
   every mounted file, so every file looked new to the output scan. The stamp is
   now written after the relabel, and microVM runs share a fixed MCS level, so
@@ -119,8 +121,9 @@ What building this taught me. Each item became code or a `sbx selftest` check.
   agent can read its token, and the endpoint also accepts someone else's API
   key, so a prompt-injected agent could send data, including the token, to a
   different Anthropic organisation. In `open` mode anything can leave. Revoke
-  the token if in doubt. Podman's secret store keeps it unencrypted (mode 0600)
-  in your user's container storage.
+  the token if in doubt.
+- **The token is stored in plain text.** Podman's secret store keeps it
+  unencrypted (mode 0600) in your container storage.
 - **The proxy can reach the LAN.** squid's ACLs keep the sandbox's requests
   away from private addresses, but squid itself runs in a normal network
   namespace. A compromised squid could reach the LAN directly.
@@ -130,8 +133,9 @@ What building this taught me. Each item became code or a `sbx selftest` check.
 - **Build-time supply chain.** Node.js, Claude Code, REA, mitmproxy, Ghidra, the
   JDK and the Fedora base image are pinned (all but Claude Code and REA by
   digest or SHA-256). npm and pip still resolve transitive dependencies at build
-  time, and npm install scripts run in the build container with unfiltered
-  network.
+  time, Fedora packages (Chromium and squid among them) come unpinned from the
+  live repositories, and npm install scripts run in the build container with
+  unfiltered network.
 
 ## Quick start
 
@@ -195,8 +199,8 @@ microVM instead.
 - A microVM cannot be `exec`'d into, so each `sbx ask`, `sh`, `cat` and
   `selftest` starts a new one (about 0.4 s). `--resume` works across them. The
   prompt is handed over as a read-only file, because piped stdin into a
-  microVM proved unreliable. If `sbx` is interrupted or terminated, it removes
-  its microVM; only `SIGKILL` can leave one running until `sbx down`.
+  microVM proved unreliable. An interrupted `sbx` removes its microVM; only
+  `SIGKILL` leaves one running until `sbx down`.
 
 ## Configuration
 
@@ -204,15 +208,17 @@ Personal settings live outside the repository in `~/.config/agent-sandbox/`
 (see `config/*.example`). Entries are absolute paths or start with `~/`.
 
 - `mount-roots`: directories below which paths may be mounted. The default is
-  `~/Downloads`. `/`, your home or anything above it are refused.
+  `~/Downloads`. `/`, your home or anything above it, hidden entries in it,
+  this repository and the config directory are refused as roots.
 - `deny-paths`: extra host paths that are never mounted or copied.
 
 `versions.env` pins every version. To update, check REA's changelog for new
 Node.js or Ghidra requirements, edit the file, run `sbx build` and then
 `sbx restart`. Node.js is not a Fedora package here, so its security releases
-need a pin bump. Environment overrides, reported whenever they apply:
-`SBX_MEMORY` (default `8g`), `SBX_CPUS` (`4`), `SBX_IMAGE`, `SBX_MOUNT_ROOTS`,
-`SBX_CONFIG_DIR`.
+need a pin bump. Environment overrides: `SBX_MEMORY` (default `8g`) and
+`SBX_CPUS` (`4`), plus `SBX_IMAGE`, `SBX_MOUNT_ROOTS` and `SBX_CONFIG_DIR`,
+which change what runs or what may be shared and are reported whenever they
+apply.
 
 Driving the sandbox from a Claude Code session on the host needs every `sbx`
 call to run outside that session's own sandbox, because rootless Podman does
@@ -223,7 +229,7 @@ material under analysis.
 ## How this was built
 
 Built from 23 to 25 October 2026 in a private repository; the history here
-starts at the import, and later commits are real follow-up work. Claude Code
+starts at the import, and later commits are follow-up work. Claude Code
 (Claude Opus) wrote most of the code and documentation in sessions I steered.
 I set the goal and the requirements, chose between the designs that came up,
 and made the security trade-offs, such as `bypassPermissions` behind the

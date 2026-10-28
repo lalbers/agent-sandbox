@@ -123,7 +123,11 @@ while read -r _ _ _ _ mnt opts _; do
         /lab/in|*/.git)
             if [ "$m" = ro ]; then pass "$mnt is read-only"; else fail "$mnt should be read-only"; fi ;;
     esac
-    if [ "$m" = ro ]; then expect_fail "write refused on $mnt" touch "$mnt/.sbx-selftest"; fi
+    if [ "$m" = ro ] && [ -d "$mnt" ]; then
+        expect_fail "write refused in $mnt" touch "$mnt/.sbx-selftest"
+    elif [ "$m" = ro ]; then
+        expect_fail "write refused on $mnt" bash -c ': >> "$1"' _ "$mnt"
+    fi
 done < /proc/self/mountinfo
 for p in "${expect_ro[@]}"; do
     if [ -d "$p" ]; then
