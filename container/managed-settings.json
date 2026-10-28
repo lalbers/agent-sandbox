@@ -3,6 +3,8 @@
     "defaultMode": "bypassPermissions"
   },
   "skipDangerousModePermissionPrompt": true,
+  "allowManagedHooksOnly": true,
+  "autoMemoryEnabled": false,
   "disableClaudeAiConnectors": true,
   "syncClaudeAiSkills": false,
   "syncClaudeAiPlugins": false

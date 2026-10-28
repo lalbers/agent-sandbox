@@ -10,10 +10,9 @@
   `chromium-browser --headless=new --no-sandbox --proxy-server="$HTTPS_PROXY"
   --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222
   --user-data-dir=/tmp/rea-browser --password-store=basic
-  --disable-background-networking --disable-component-update --no-first-run <url>`
-  (the last three stop Chromium's own calls to Google services)
-  (`--no-sandbox` because the container already is the sandbox and has no
-  privileges for Chromium's own one).
+  --disable-background-networking --disable-component-update --no-first-run <url>`.
+  The last three flags stop Chromium's calls to Google services; `--no-sandbox`
+  is needed because the container has no privileges for Chromium's own sandbox.
 
 ### Runtime analysis
 

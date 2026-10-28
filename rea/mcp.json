@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "rea": {
-      "command": "/usr/local/bin/rea",
-      "args": ["mcp"],
+      "command": "/usr/bin/env",
+      "args": ["-u", "CLAUDE_CODE_OAUTH_TOKEN", "/usr/local/bin/rea", "mcp"],
       "env": {
         "GHIDRA_INSTALL_DIR": "/opt/ghidra",
         "JAVA_HOME": "/opt/jdk",

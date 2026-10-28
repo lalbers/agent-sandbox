@@ -1,17 +1,31 @@
 #!/bin/bash
-# Seed the persistent home (state/home on the host) from the image skeleton,
+# Reset the persistent home (state/home on the host) to the image skeleton,
 # then run the container command (default `sleep infinity`, so the host CLI
 # can `podman exec` into the running sandbox).
 set -euo pipefail
 
 skel=/opt/claude-sbx/skel
+[ "$HOME" = /home/agent ] || { echo "sbx-entrypoint: unexpected HOME=$HOME" >&2; exit 1; }
 
-# Image-owned files (e.g. the REA skill) are small; refresh them on every start
-# so the home always matches the image.
+# Only Claude's conversation transcripts survive from one start to the next
+# (for --resume). Everything else a hostile sample could have left for a later
+# session to run or obey goes: settings and hooks, CLAUDE.md, skills, agents,
+# auto memory, shell startup files, npm/pip caches.
+find "$HOME" -mindepth 1 -maxdepth 1 ! -name .claude -exec rm -rf -- {} +
+if [ -d "$HOME/.claude" ] && [ ! -L "$HOME/.claude" ]; then
+    find "$HOME/.claude" -mindepth 1 -maxdepth 1 ! -name projects -exec rm -rf -- {} +
+    if [ -d "$HOME/.claude/projects" ] && [ ! -L "$HOME/.claude/projects" ]; then
+        find "$HOME/.claude/projects" -mindepth 1 -maxdepth 1 ! -type d -exec rm -rf -- {} +
+        find "$HOME/.claude/projects" -mindepth 2 \( ! -name '*.jsonl' -o ! -type f \) -prune -exec rm -rf -- {} +
+    else
+        rm -rf -- "$HOME/.claude/projects"
+    fi
+else
+    rm -rf -- "$HOME/.claude"
+fi
+
 cp -R "$skel/." "$HOME/"
-
-# Claude's own state file is only seeded once; Claude rewrites it at runtime.
-[ -f "$HOME/.claude.json" ] || cp /opt/claude-sbx/claude.json "$HOME/.claude.json"
+cp /opt/claude-sbx/claude.json "$HOME/.claude.json"
 
 # In a microVM the guest kernel does not apply the container's confinement;
 # sbx-guard sets no_new_privs and a seccomp filter before the command runs.

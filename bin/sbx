@@ -62,10 +62,10 @@ Lifecycle
   sbx up [--net api|open|none] [--vm] [--mount PATH[:ro|:rw]]... [--copy PATH]... [--replace]
                                  --vm: every command runs in a fresh libkrun microVM
                                  (own guest kernel; for executing untrusted targets)
-  sbx restart                    recreate with the last --net/--mount options (e.g. after token set)
-  sbx down                       stop and remove (the proxy log is saved to logs/)
+  sbx restart                    recreate with the last --net/--vm/--mount options (e.g. after token set)
+  sbx down                       stop, check outputs, remove (the proxy log is saved to logs/)
   sbx status
-  sbx reset [--yes]              wipe the sandbox home (Claude sessions, caches)
+  sbx reset [--yes]              wipe the sandbox home (Claude session transcripts)
 
 Files
   sbx in PATH...                 copy into /lab/in (read-only inside the sandbox)
@@ -91,8 +91,8 @@ Networks: api = Anthropic API only (default), open = internet but never LAN or
 host, none = no network (Claude cannot run, `sbx sh` still works).
 Mounts are read-only unless :rw, appear under /host/<path>, and are limited to
 the mount roots (~/.config/agent-sandbox/mount-roots, default ~/Downloads).
-Existing .git dirs in rw mounts stay ro; new .git/.envrc/symlinks there are
-reported by `sbx ask` and `sbx down`. Extra protected paths:
+In rw mounts, existing .git, .claude, .envrc and similar entries stay read-only;
+`sbx down` lists every file the sandbox changed there. Extra protected paths:
 ~/.config/agent-sandbox/deny-paths.
 Environment: SBX_IMAGE, SBX_MEMORY (8g), SBX_CPUS (4), SBX_MOUNT_ROOTS (overrides
 mount-roots, colon-separated), SBX_CONFIG_DIR.
@@ -179,7 +179,10 @@ to_mib() {
 # erasing. Malformed UTF-8 becomes U+FFFD instead of aborting the output.
 sanitize() {
     if command -v perl >/dev/null; then
-        perl -MEncode -pe '$_ = Encode::decode("UTF-8", $_); s/[^\t\n\P{Cc}]//g; $_ = Encode::encode("UTF-8", $_)'
+        # Also bidi controls, which can reorder what a terminal displays.
+        perl -MEncode -pe '$_ = Encode::decode("UTF-8", $_);
+            s/[^\t\n\P{Cc}]|[\x{061C}\x{200E}\x{200F}\x{202A}-\x{202E}\x{2066}-\x{2069}]//g;
+            $_ = Encode::encode("UTF-8", $_)'
     else
         tr -d '\000-\010\013-\037\177'
     fi
@@ -187,20 +190,29 @@ sanitize() {
 
 # ---------------------------------------------------------------- path policy
 
-# read_list FILE: the paths in a config file, one per line, without comments
-# and blank lines; a leading ~/ becomes $HOME.
+# read_list FILE: the paths in a config file, one per line. Lines starting
+# with # and blank lines are skipped, a leading ~/ becomes $HOME, and every
+# entry must then be absolute: a typo must not silently protect nothing.
 read_list() {
     local line
-    [ -f "$1" ] || return 0
+    [ -e "$1" ] || return 0
+    [ -r "$1" ] || die "cannot read $1"
     while IFS= read -r line || [ -n "$line" ]; do
-        line=${line%%#*}
         line=${line#"${line%%[![:space:]]*}"}
         line=${line%"${line##*[![:space:]]}"}
-        [ -n "$line" ] || continue
+        case $line in ''|'#'*) continue ;; esac
+        # shellcheck disable=SC2088  # a literal ~ in the file is expanded here
         case $line in "~") line=$HOME ;; "~/"*) line=$HOME/${line#"~/"} ;; esac
+        [[ $line == /* ]] || die "$1: '$line' is not an absolute path (write /... or ~/...)"
         printf '%s\n' "$line"
     done < "$1"
 }
+
+# is_within PATH DIR: PATH is DIR or lies below it.
+is_within() { [ "$1" = "$2" ] || [ "$2" = / ] || [[ $1 == "$2"/* ]]; }
+
+# Canonical home: paths are compared after resolving symlinks, so must $HOME be.
+HOME_REAL=$(realpath -e -- "$HOME") || die "cannot resolve \$HOME"
 
 if [ -n "${SBX_MOUNT_ROOTS:-}" ]; then
     MOUNT_ROOTS=$SBX_MOUNT_ROOTS
@@ -208,17 +220,25 @@ else
     MOUNT_ROOTS=$(read_list "$SBX_CONFIG_DIR/mount-roots" | paste -sd: -)
     MOUNT_ROOTS=${MOUNT_ROOTS:-$HOME/Downloads}
 fi
-mapfile -t EXTRA_DENY < <(read_list "$SBX_CONFIG_DIR/deny-paths")
+EXTRA_DENY=()
+deny_list=$(read_list "$SBX_CONFIG_DIR/deny-paths")
+if [ -n "$deny_list" ]; then mapfile -t EXTRA_DENY <<< "$deny_list"; fi
+unset deny_list
 
-# is_within PATH DIR: PATH is DIR or lies below it.
-is_within() { [ "$1" = "$2" ] || [ "$2" = / ] || [[ $1 == "$2"/* ]]; }
+# Env overrides change the policy; say so whenever a command applies it.
+warn_overrides() {
+    if [ -n "${SBX_MOUNT_ROOTS:-}" ]; then note "mount roots from SBX_MOUNT_ROOTS: $SBX_MOUNT_ROOTS"; fi
+    if [ "$SBX_CONFIG_DIR" != "${XDG_CONFIG_HOME:-$HOME/.config}/agent-sandbox" ]; then
+        note "config from SBX_CONFIG_DIR: $SBX_CONFIG_DIR"
+    fi
+}
 
 # Print why PATH must never be shared with the sandbox; print nothing if it may.
 deny_reason() {
     local p=$1 d
-    if is_within "$HOME" "$p"; then echo "contains your whole home directory"; return; fi
-    if [[ $p == "$HOME"/.* ]]; then echo "hidden entry in \$HOME (credentials and configuration)"; return; fi
-    for d in /proc /sys /dev /run /var/run /boot "$SBX_ROOT" "${EXTRA_DENY[@]}"; do
+    if is_within "$HOME_REAL" "$p"; then echo "contains your whole home directory"; return; fi
+    if [[ $p == "$HOME_REAL"/.* ]]; then echo "hidden entry in \$HOME (credentials and configuration)"; return; fi
+    for d in /proc /sys /dev /run /var/run /boot "$SBX_ROOT" "$SBX_CONFIG_DIR" "${EXTRA_DENY[@]}"; do
         d=$(realpath -m -- "$d")
         if is_within "$p" "$d"; then echo "inside protected path $d"; return; fi
         if is_within "$d" "$p"; then echo "contains protected path $d"; return; fi
@@ -239,12 +259,20 @@ check_shareable() {
     [ -z "$why" ] || die "refusing $1: $why"
 }
 
+# A mount root is refused if it would make the policy meaningless: /, a
+# directory that contains your home, a hidden entry in it, or anything inside
+# this repository or the config directory. Missing roots are skipped.
 in_mount_roots() {
-    local root roots=()
+    local root r roots=()
     IFS=: read -ra roots <<< "$MOUNT_ROOTS"
     for root in "${roots[@]}"; do
         [ -n "$root" ] || continue
-        if is_within "$1" "$(realpath -m -- "$root")"; then return 0; fi
+        r=$(realpath -e -- "$root" 2>/dev/null) || continue
+        if [ "$r" = / ] || is_within "$HOME_REAL" "$r" || [[ $r == "$HOME_REAL"/.* ]] \
+            || is_within "$r" "$SBX_ROOT" || is_within "$r" "$(realpath -m -- "$SBX_CONFIG_DIR")"; then
+            die "mount root $root is not allowed (/, your home or above, hidden entries, this repo, the config dir)"
+        fi
+        if is_within "$1" "$r"; then return 0; fi
     done
     return 1
 }
@@ -267,6 +295,39 @@ check_relabel_safe() {
     [ -z "$hit" ] || die "refusing $p: hard-linked file $hit would be relabelled for all its links; use --copy"
 }
 
+# Names that make host tools run or load something when you work in that
+# directory later: git (hooks, core.fsmonitor), direnv, Claude Code project
+# settings, hooks and memory, MCP configs, editor tasks, pre-commit.
+RISKY_NAMES=(.git .envrc .claude .mcp.json CLAUDE.md .husky .vscode .idea .devcontainer .pre-commit-config.yaml)
+RISKY_FIND=()
+for n in "${RISKY_NAMES[@]}"; do RISKY_FIND+=(-o -name "$n"); done
+RISKY_FIND=("(" "${RISKY_FIND[@]:1}" ")")
+unset n
+
+# risky_entries DIR: NUL-separated paths below DIR that host tools would act
+# on: entries named in RISKY_NAMES, and git repositories under any name (a
+# directory holding HEAD, objects/ and refs/: git uses it as a bare repo).
+# Nested hits inside an earlier hit are left out.
+risky_entries() {
+    local f a skip acc=()
+    {
+        find "$1" -xdev -mindepth 1 "${RISKY_FIND[@]}" -prune -print0 2>/dev/null
+        while IFS= read -r -d '' f; do
+            f=${f%/HEAD}
+            if [ -d "$f/objects" ] && [ -d "$f/refs" ] && [ "$f" != "$1" ]; then printf '%s\0' "$f"; fi
+        done < <(find "$1" -xdev -mindepth 2 -type f -name HEAD -print0 2>/dev/null)
+    } | sort -zu | while IFS= read -r -d '' f; do
+        skip=0
+        for a in "${acc[@]}"; do
+            if is_within "$f" "$a"; then skip=1; break; fi
+        done
+        if [ "$skip" = 0 ]; then
+            acc+=("$f")
+            printf '%s\0' "$f"
+        fi
+    done
+}
+
 # add_mount PATH[:ro|:rw] — validate a bind mount and append it to MOUNT_ARGS.
 add_mount() {
     local spec=$1 raw mode p dst g
@@ -278,29 +339,47 @@ add_mount() {
     p=$(resolve_path "$raw") || exit 1
     check_shareable "$p"
     in_mount_roots "$p" || die "refusing $p: only paths below ${MOUNT_ROOTS//:/, } can be mounted; use --copy"
+    if [ "$mode" = rw ]; then
+        case "$p/" in */.git/*) die "refusing $p: rw mounts inside git metadata are not allowed" ;; esac
+    fi
     check_relabel_safe "$p"
     dst=/host$p
-    MOUNT_ARGS+=(-v "$p:$dst:$mode,z,bind")
+    MOUNT_ARGS+=(-v "$p:$dst:$mode,Z,bind")
     MOUNT_SPECS+=("$p:$mode")
     note "mount $mode $p -> $dst"
     if [ "$mode" = rw ]; then
-        # Every existing .git (also nested repos and submodules) stays
-        # read-only, otherwise the agent could plant hooks or config that run
-        # on the host. New .git entries are reported by scan_outputs.
+        # Existing entries host tools act on (git metadata of nested repos and
+        # submodules too) stay read-only, otherwise the agent could plant hooks
+        # or config that run on the host. New ones are reported by scan_outputs.
         while IFS= read -r -d '' g; do
             [ ! -L "$g" ] || die "refusing $p: $g is a symlink"
             case $g in *[:,]*|*$'\n'*) die "refusing $p: unsupported character in $g" ;; esac
-            MOUNT_ARGS+=(-v "$g:/host$g:ro,z,bind")
-            note "mount ro $g (git metadata stays read-only)"
-        done < <(find "$p" -xdev -name .git -prune -print0 2>/dev/null)
+            MOUNT_ARGS+=(-v "$g:/host$g:ro,Z,bind")
+            note "mount ro $g (stays read-only)"
+        done < <(risky_entries "$p")
     fi
+}
+
+# session_rw_mounts: the rw mount sources of the current session (from `sbx up`).
+session_rw_mounts() {
+    local spec last=()
+    session_active && [ -f "$LAST_UP" ] || return 0
+    mapfile -d '' -t last < "$LAST_UP"
+    for spec in "${last[@]}"; do
+        case $spec in /*:rw) printf '%s\n' "${spec%:rw}" ;; esac
+    done
 }
 
 # check_copy PATH — validate a copy source and print its canonical path.
 check_copy() {
-    local src name
+    local src name m
     src=$(resolve_path "$1") || exit 1
     check_shareable "$src"
+    # A running sandbox could swap parts of a path in its rw mounts between
+    # this check and the copy.
+    while IFS= read -r m; do
+        if is_within "$src" "$m"; then die "refusing $src: inside an rw mount of the running sandbox (sbx down first)"; fi
+    done < <(session_rw_mounts)
     name=$(basename -- "$src")
     [ ! -e "$LAB_IN/$name" ] || die "lab/in/$name already exists; remove it there first"
     printf '%s\n' "$src"
@@ -317,15 +396,28 @@ copy_in() {
     note "copied $src -> /lab/in/${dst##*/} ($(du -sh -- "$dst" | cut -f1))"
 }
 
+# is_risky_path PATH: a path component is one of RISKY_NAMES.
+is_risky_path() {
+    local n
+    for n in "${RISKY_NAMES[@]}"; do
+        case "/$1/" in */"$n"/*) return 0 ;; esac
+    done
+    return 1
+}
+
 # scan_outputs report|defuse — find what the sandbox left behind that could act
-# on the host. lab/out: symlinks and special files (host tools would follow them
-# to host files), .git and .envrc (a git-aware prompt or direnv runs them on
-# `cd`). rw mounts: new .git/.envrc entries and symlinks, by ctime, which the
-# sandbox cannot backdate. "defuse" (sbx down, container already stopped)
-# removes/renames the lab/out entries; "report" (sandbox still running, it may
-# still be using them) only lists them. Never aborts: a failed step is reported.
+# on the host.
+#   lab/out: symlinks and special files (host tools would follow them to host
+#     files) and risky entries (see RISKY_NAMES; a git-aware prompt, direnv or
+#     your host Claude Code acts on them when you work there).
+#   rw mounts: every file changed during the session, by ctime, which the
+#     sandbox cannot backdate; risky ones and symlinks are flagged.
+# "defuse" (sbx down, sandbox already stopped) removes symlinks and moves risky
+# entries to state/quarantine with all permissions removed; "report" (sandbox
+# still running and maybe using them) only lists. Never aborts: a failed step
+# is reported.
 scan_outputs() {
-    local mode=$1 f src rel spec hits=() last=()
+    local mode=$1 f src rel quarantine n=0 hits=() changed=()
     if [ "$mode" = defuse ]; then
         # The sandbox writes as your UID; reopen directories it locked with chmod.
         chmod -R u+rwX -- "$LAB_OUT" 2>/dev/null || true
@@ -341,29 +433,47 @@ scan_outputs() {
             hits+=("lab/out: COULD NOT remove (not a regular file): $rel")
         fi
     done < <(find "$LAB_OUT" -mindepth 1 ! -type f ! -type d -print0 2>/dev/null)
+    quarantine=$SBX_ROOT/state/quarantine/$(date +%Y%m%d-%H%M%S)
     while IFS= read -r -d '' f; do
         rel=${f#"$LAB_OUT"/}
-        rel=${rel//$'\n'/\\n}
         if [ "$mode" = report ]; then
-            hits+=("lab/out: $rel (renamed at sbx down)")
-        elif mv -T -- "$f" "$f.sbx-quarantine-$(date +%Y%m%d%H%M%S%N)" 2>/dev/null; then
-            hits+=("lab/out: quarantined (renamed): $rel")
+            hits+=("lab/out: ${rel//$'\n'/\\n} (quarantined at sbx down)")
+        elif mkdir -p -- "$(dirname -- "$quarantine/$rel")" \
+                && mv -T -- "$f" "$quarantine/$rel" 2>/dev/null \
+                && chmod 000 -- "$quarantine/$rel"; then
+            hits+=("lab/out: quarantined to ${quarantine#"$SBX_ROOT"/}: ${rel//$'\n'/\\n}")
         else
-            hits+=("lab/out: COULD NOT quarantine: $rel")
+            hits+=("lab/out: COULD NOT quarantine: ${rel//$'\n'/\\n}")
         fi
-    done < <(find "$LAB_OUT" -mindepth 1 \( -name .git -o -name .envrc \) -prune -print0 2>/dev/null)
-    # rw mounts of the current session, as recorded by `sbx up` (canonical PATH:rw).
-    if [ -f "$UP_STAMP" ] && session_active && [ -f "$LAST_UP" ]; then
-        mapfile -d '' -t last < "$LAST_UP"
-        for spec in "${last[@]}"; do
-            case $spec in /*:rw) src=${spec%:rw} ;; *) continue ;; esac
+    done < <(risky_entries "$LAB_OUT")
+    # rw mounts of the current session, as recorded by `sbx up`.
+    if [ -f "$UP_STAMP" ]; then
+        while IFS= read -r src; do
             while IFS= read -r -d '' f; do
-                hits+=("rw mount: new ${f//$'\n'/\\n}")
-            done < <(find "$src" -xdev -cnewer "$UP_STAMP" \( -name .git -o -name .envrc -o -type l \) -print0 2>/dev/null)
-        done
+                n=$((n + 1))
+                if [ -L "$f" ] || is_risky_path "${f#"$src"}"; then
+                    hits+=("rw mount: RISKY new/changed: ${f//$'\n'/\\n}")
+                else
+                    changed+=("${f//$'\n'/\\n}")
+                fi
+            done < <(find "$src" -xdev -cnewer "$UP_STAMP" ! -type d -print0 2>/dev/null)
+            while IFS= read -r -d '' f; do
+                if [ "$(find "$f/HEAD" -cnewer "$UP_STAMP" 2>/dev/null)" ]; then
+                    hits+=("rw mount: RISKY new git repository: ${f//$'\n'/\\n}")
+                fi
+            done < <(risky_entries "$src")
+        done < <(session_rw_mounts)
+    fi
+    if [ ${#changed[@]} -gt 0 ] && [ "$mode" = report ]; then
+        hits+=("rw mounts: $n file(s) changed so far (full list at sbx down)")
+    elif [ ${#changed[@]} -gt 0 ]; then
+        mkdir -p "$LOGS"
+        f=$LOGS/changes-$(date +%Y%m%d-%H%M%S).txt
+        printf '%s\n' "${changed[@]}" > "$f"
+        hits+=("rw mounts: $n file(s) changed by the sandbox, ${#changed[@]} of them ordinary; list in ${f#"$SBX_ROOT"/}")
     fi
     [ ${#hits[@]} -gt 0 ] || return 0
-    note "WARNING: review before using these on the host (git hooks/config, direnv and symlinks act on the host):"
+    note "WARNING: review before using these on the host (they can run code or redirect host tools):"
     printf '  %s\n' "${hits[@]}" | sanitize >&2
     if [ "$mode" = report ]; then
         note "the sandbox is still running: read results with 'sbx cat', not from the host; sbx down re-checks"
@@ -408,11 +518,15 @@ stop_all() {
         podman rm -f -t 0 $ids >/dev/null 2>&1 || true
     done
     if is_running "$CTR" || [ -n "$(vm_runs)" ]; then
-        note "WARNING: could not stop the sandbox, so lab/out was NOT checked; do not use it from the host, run sbx down again"
-    else
-        scan_outputs defuse || true
-        rm -f "$MODE_FILE" "$VM_ARGS"
+        # Keep the session state, so the next `sbx down` checks it again, and
+        # fail: `sbx up --replace` must not continue on top of it.
+        note "WARNING: could not stop the sandbox, so its outputs were NOT checked; do not use lab/out or rw mounts from the host, run sbx down again"
+        save_egress_log
+        rm -f "$STOPPING"
+        return 1
     fi
+    scan_outputs defuse || true
+    rm -f "$MODE_FILE" "$VM_ARGS"
     save_egress_log
     podman rm -f -t 5 --ignore "$CTR" "$EGRESS" >/dev/null
     rm -f "$STOPPING"
@@ -422,13 +536,15 @@ stop_all() {
 # (for nested containers). Derive a profile that refuses new namespaces, as
 # Docker's default does: no user namespace means no in-container "root" and a
 # much smaller kernel attack surface. clone3 cannot be filtered by flags, so it
-# returns ENOSYS and libc falls back to clone.
+# returns ENOSYS and libc falls back to clone. The kernel keyring syscalls go
+# as well (nothing here needs them; sbx-guard refuses them in the microVM too).
 write_seccomp_profile() {
     local ns_flags=2114060288   # CLONE_NEWNS|NEWCGROUP|NEWUTS|NEWIPC|NEWUSER|NEWPID|NEWNET
     [ -r "$SECCOMP_DEFAULT" ] || die "missing $SECCOMP_DEFAULT (containers-common)"
     mkdir -p "$(dirname "$SECCOMP")"
     jq --argjson ns "$ns_flags" '
-        .syscalls |= map(.names |= map(select(. != "clone" and . != "clone3" and . != "unshare")))
+        .syscalls |= map(.names |= map(select(. as $n
+            | ["clone", "clone3", "unshare", "keyctl", "add_key", "request_key"] | index($n) | not)))
         | .syscalls |= map(select(.names | length > 0))
         | .syscalls += [
             {names: ["clone", "unshare"], action: "SCMP_ACT_ALLOW",
@@ -453,6 +569,7 @@ cmd_up() {
         esac
     done
     case $net in api|open|none) ;; *) die "--net must be api, open or none" ;; esac
+    warn_overrides
     podman image exists "$IMAGE" || die "image $IMAGE is missing (sbx build)"
     if [ "$net" != none ]; then
         podman image exists "$IMG_EGRESS" || die "image $IMG_EGRESS is missing (sbx build egress)"
@@ -488,9 +605,13 @@ cmd_up() {
         net_args=(--network none)
     else
         ensure_networks
+        # squid parses whatever the agent sends, so it gets the same seccomp
+        # profile. Its own network namespace can reach the LAN; only its ACLs
+        # keep the sandbox's requests away from it.
         podman run -d --init --name "$EGRESS" --hostname "$EGRESS" \
             --network "$NET_INT:ip=$EGRESS_IP" --network "$NET_EXT" \
             --cap-drop=ALL --security-opt=no-new-privileges --read-only \
+            --security-opt "seccomp=$SECCOMP" \
             --pids-limit 256 --memory 512m \
             -e SBX_NET="$net" -e TZ="$(host_tz)" \
             "$IMG_EGRESS" >/dev/null
@@ -505,7 +626,7 @@ cmd_up() {
     # applies to the VMM process on the host, the guest gets its own kernel.
     # shellcheck disable=SC2054  # the commas belong to the tmpfs options
     box_args=(--hostname "$CTR" "${net_args[@]}"
-              --userns=keep-id --user 1000:1000
+              --userns=keep-id:uid=1000,gid=1000 --user 1000:1000
               --cap-drop=ALL --security-opt=no-new-privileges
               --security-opt "seccomp=$SECCOMP"
               --read-only --tmpfs /tmp:rw,exec,nosuid,nodev,size=2g
@@ -944,6 +1065,7 @@ cmd_selftest() {
 cmd_check() {
     local spec rc=0
     [ $# -gt 0 ] || die "check: PATH[:ro|:rw]..."
+    warn_overrides
     for spec in "$@"; do
         if (MOUNT_ARGS=() MOUNT_SPECS=(); add_mount "$spec") 2>&1; then
             echo "OK       $spec"
