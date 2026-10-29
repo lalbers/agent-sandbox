@@ -333,11 +333,14 @@ check_relabel_safe() {
 }
 
 # Names that make host tools run or load something when you work in that
-# directory later: git (hooks, core.fsmonitor), direnv, Claude Code project
-# settings, hooks and memory, MCP configs, editor tasks, pre-commit, package
-# manager and toolchain configuration that can name commands to run.
-RISKY_NAMES=(.git .envrc .claude .mcp.json CLAUDE.md CLAUDE.local.md .husky .vscode .idea
-             .devcontainer .pre-commit-config.yaml .github .npmrc .yarnrc .yarnrc.yml
+# directory later: git (hooks, core.fsmonitor, submodules, attributes),
+# Mercurial and Jujutsu, direnv, Claude Code project settings, hooks and
+# memory, other coding agents' instructions and settings, MCP configs, editor
+# tasks, pre-commit, package manager and toolchain configuration that can name
+# commands to run.
+RISKY_NAMES=(.git .gitmodules .gitattributes .hg .jj .envrc .claude .mcp.json CLAUDE.md
+             CLAUDE.local.md AGENTS.md GEMINI.md .gemini .cursor .cursorrules .husky .vscode
+             .idea .devcontainer .pre-commit-config.yaml .github .npmrc .yarnrc .yarnrc.yml
              .cargo .mvn mise.toml .mise.toml)
 RISKY_FIND=()
 for n in "${RISKY_NAMES[@]}"; do RISKY_FIND+=(-o -name "$n"); done

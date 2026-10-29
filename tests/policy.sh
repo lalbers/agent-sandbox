@@ -68,6 +68,15 @@ expect refused "$R/proj.git/hooks:rw" "git metadata"
 expect refused "$R/proj.git/config:rw" "git metadata"
 expect ok "$R/proj.git/hooks:ro"
 
+# Other agents' instruction files and other VCS directories are risky too:
+# overlaid read-only inside an rw mount, never rw themselves.
+mkdir -p "$R/agents/.gemini" "$R/agents/.hg"
+touch "$R/agents/AGENTS.md" "$R/agents/.gitmodules"
+expect ok "$R/agents:rw" "mount ro $R/agents/AGENTS.md (stays read-only)"
+expect ok "$R/agents:rw" "mount ro $R/agents/.hg (stays read-only)"
+expect ok "$R/agents:rw" "mount ro $R/agents/.gitmodules (stays read-only)"
+expect refused "$R/agents/.gemini:rw" "tool configuration"
+
 # Relabelling a hard-linked file would relabel its other links too.
 mkdir -p "$R/hardlink"
 echo x > "$R/hardlink/a"
