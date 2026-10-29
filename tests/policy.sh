@@ -71,6 +71,18 @@ expect refused "$R/proj.git/hooks:rw" "git metadata"
 expect refused "$R/proj.git/config:rw" "git metadata"
 expect ok "$R/proj.git/hooks:ro"
 
+# git also accepts a symlinked HEAD (even a dangling one), and a commondir file
+# alone marks a linked worktree's git directory.
+mkdir -p "$R/link.git/hooks" "$R/link.git/objects" "$R/link.git/refs"
+ln -s refs/heads/main "$R/link.git/HEAD"
+expect refused "$R/link.git/hooks:rw" "git metadata"
+mkdir -p "$R/wt-gitdir/hooks"
+echo ../.. > "$R/wt-gitdir/commondir"
+expect refused "$R/wt-gitdir/hooks:rw" "git metadata"
+mkdir -p "$R/outer"
+cp -a "$R/link.git" "$R/outer/link.git"
+expect ok "$R/outer:rw" "mount ro $R/outer/link.git (stays read-only)"
+
 # Other agents' instruction files and other VCS directories are risky too:
 # overlaid read-only inside an rw mount, never rw themselves.
 mkdir -p "$R/agents/.gemini" "$R/agents/.hg"

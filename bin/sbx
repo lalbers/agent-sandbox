@@ -377,7 +377,8 @@ unset n
 
 # is_git_dir DIR: git would use DIR as a repository (bare or worktree-style
 # gitdir: it only needs a HEAD file, or a commondir file pointing elsewhere).
-is_git_dir() { [ -f "$1/HEAD" ] || [ -f "$1/commondir" ]; }
+# git also accepts a symlinked HEAD, even a dangling one.
+is_git_dir() { [ -f "$1/HEAD" ] || [ -L "$1/HEAD" ] || [ -f "$1/commondir" ]; }
 
 # inside_git_dir PATH: PATH or a directory above it is a git directory, so
 # PATH may be its hooks, config or anything else git acts on. Bare
@@ -402,7 +403,7 @@ risky_entries() {
     local f a skip named=() gitfiles=() found=()
     RISKY=()
     find0 named "$1" -xdev -mindepth 1 "${RISKY_FIND[@]}" -prune -print0 || return 1
-    find0 gitfiles "$1" -xdev -mindepth 1 -type f \( -name HEAD -o -name commondir \) -print0 || return 1
+    find0 gitfiles "$1" -xdev -mindepth 1 \( -type f -o -type l \) \( -name HEAD -o -name commondir \) -print0 || return 1
     found=("${named[@]}")
     for f in "${gitfiles[@]}"; do
         if [ "${f%/*}" = "$1" ]; then found+=("$f"); else found+=("${f%/*}"); fi
