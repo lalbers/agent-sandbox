@@ -99,7 +99,11 @@ if [ "$mode" = api ] || [ "$mode" = open ]; then
         c=$(http_code https://example.com/)
         if [ "$c" != 000 ]; then pass "public internet reachable (example.com HTTP $c)"; else fail "example.com not reachable"; fi
     fi
-    for target in "${probes[@]}" 127.0.0.1 host.containers.internal; do
+    # Also other spellings of loopback and the IPv6 ranges that embed IPv4
+    # addresses or lead to local networks (see blocked_dst in common.conf).
+    for target in "${probes[@]}" 127.0.0.1 host.containers.internal 127.1 0x7f000001 \
+            '[::1]' '[::ffff:127.0.0.1]' '[::127.0.0.1]' '[64:ff9b::7f00:1]' \
+            '[64:ff9b:1::7f00:1]' '[2002:7f00:1::]' '[2001::1]' '[fe80::1]' '[fd00::1]'; do
         if proxy_denied "http://$target/"; then pass "proxy refuses http://$target/"; else fail "proxy does not refuse http://$target/"; fi
         c=$(connect_code --noproxy '' -x "$HTTP_PROXY" "https://$target/")
         if [ "$c" = 403 ]; then pass "proxy refuses CONNECT $target:443"; else fail "proxy does not refuse CONNECT $target:443 ($c)"; fi
