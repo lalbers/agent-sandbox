@@ -45,6 +45,7 @@ UP_STAMP=$SBX_DATA_DIR/state/up-stamp
 MODE_FILE=$SBX_DATA_DIR/state/mode         # "container|vm NET" while a session is up
 VM_ARGS=$SBX_DATA_DIR/state/vm-args        # podman run args + image for microVM runs
 STOPPING=$SBX_DATA_DIR/state/stopping      # set while `sbx down` runs: no new microVMs
+VM_LOCK=$SBX_DATA_DIR/state/vm.lock        # shared by microVM runs, exclusive for `sbx down`
 VM_LABEL=sbx.vm
 # Fixed SELinux MCS categories for microVM runs: each run is a new container,
 # a stable level keeps relabelling a no-op (stable ctimes for scan_outputs)
@@ -134,6 +135,19 @@ require_container_mode() {
     if in_vm_mode; then die "$1 is not available in vm mode (a microVM cannot be exec'd into); use sbx ask"; fi
 }
 
+# vm_lock_shared: hold the microVM lock (shared) until vm_unlock or exit, so
+# that `sbx down`, which takes it exclusively, can neither miss a microVM that
+# is about to start nor scan while one runs. Waiting may outlast the session,
+# hence the checks after the lock is held.
+vm_lock_shared() {
+    mkdir -p "$(dirname "$VM_LOCK")"
+    exec {VM_LOCK_FD}>>"$VM_LOCK"
+    flock -s "$VM_LOCK_FD"
+    [ ! -f "$STOPPING" ] || die "the sandbox is being stopped"
+    in_vm_mode && [ -f "$VM_ARGS" ] || die "sandbox is not running (sbx up)"
+}
+vm_unlock() { exec {VM_LOCK_FD}>&-; }
+
 # box [podman exec/run options...] -- CMD...: run CMD in the sandbox — exec
 # into the container, or in vm mode a fresh one-shot microVM with the settings
 # saved by `sbx up --vm`. Options: -i, -t, -w DIR.
@@ -142,7 +156,7 @@ box() {
     while [ $# -gt 0 ] && [ "$1" != -- ]; do opts+=("$1"); shift; done
     shift
     if in_vm_mode; then
-        [ ! -f "$STOPPING" ] || die "the sandbox is being stopped"
+        vm_lock_shared
         mapfile -d '' -t saved < "$VM_ARGS"
         # Named, and removed if sbx is interrupted: a killed podman client
         # would otherwise leave the microVM (and the agent in it) running.
@@ -164,6 +178,7 @@ box() {
         # Finished and removed (--rm): nothing left for the trap, whose kill
         # could otherwise hit a reused PID.
         BOX_PID="" BOX_RUN=""
+        vm_unlock
         return "$rc"
     else
         podman exec "${opts[@]}" "$CTR" "$@"
@@ -642,7 +657,7 @@ save_egress_log() {
 }
 
 stop_all() {
-    local ids _
+    local ids lock locked=0 _
     # Stop the sandbox (container and any microVM runs) before scanning: a
     # process the agent left running could otherwise re-plant files after the
     # scan or race it. The stopping flag keeps sbx from starting new microVMs.
@@ -650,13 +665,18 @@ stop_all() {
     touch "$STOPPING"
     podman stop -t 5 --ignore "$CTR" >/dev/null 2>&1 || true
     if is_running "$CTR"; then podman kill "$CTR" >/dev/null 2>&1 || true; fi
-    for _ in 1 2 3; do
+    # Every microVM run holds the lock shared (vm_lock_shared). Remove runs
+    # until the lock is ours exclusively: then none is left, including one
+    # that passed its stopping check just before the flag was set.
+    exec {lock}>>"$VM_LOCK"
+    for _ in $(seq 1 30); do
         ids=$(podman ps -aq --filter "label=$VM_LABEL=1" 2>/dev/null) || ids=""
-        [ -n "$ids" ] || break
         # shellcheck disable=SC2086  # one container ID per word
-        podman rm -f -t 0 $ids >/dev/null 2>&1 || true
+        if [ -n "$ids" ]; then podman rm -f -t 0 $ids >/dev/null 2>&1 || true; fi
+        if flock -x -w 1 "$lock"; then locked=1; break; fi
     done
-    if is_running "$CTR" || [ -n "$(vm_runs)" ]; then
+    if [ "$locked" = 0 ] || is_running "$CTR" || [ -n "$(vm_runs)" ]; then
+        exec {lock}>&-
         # Keep the session state, so the next `sbx down` checks it again, and
         # fail: `sbx up --replace` must not continue on top of it.
         note "WARNING: could not stop the sandbox, so its outputs were NOT checked; do not use lab/out or rw mounts from the host, run sbx down again"
@@ -669,6 +689,7 @@ stop_all() {
     save_egress_log
     podman rm -f -t 5 --ignore "$CTR" "$EGRESS" >/dev/null
     rm -f "$STOPPING"
+    exec {lock}>&-
 }
 
 # Podman's default seccomp profile allows clone/clone3/unshare without limits
@@ -1159,9 +1180,10 @@ check_vm_boundary() {
     else
         echo "FAIL  guest kernel '${guest:-?}' is not distinct from the host's"; rc=1
     fi
+    vm_lock_shared
     mapfile -d '' -t saved < "$VM_ARGS"
     podman rm -f -t 0 --ignore "$vmm" >/dev/null 2>&1
-    podman run -d --rm --name "$vmm" "${saved[@]}" sleep 20 >/dev/null || { echo "FAIL  could not start a microVM"; return 1; }
+    podman run -d --rm --name "$vmm" "${saved[@]}" sleep 20 >/dev/null || { vm_unlock; echo "FAIL  could not start a microVM"; return 1; }
     pid=$(podman inspect -f '{{.State.Pid}}' "$vmm" 2>/dev/null) || pid=""
     st=/proc/${pid:-0}/status
     if [ -n "$pid" ] && [ -r "$st" ]; then
@@ -1177,6 +1199,7 @@ check_vm_boundary() {
         echo "FAIL  could not inspect the VMM process"; rc=$((rc + 1))
     fi
     podman rm -f -t 0 --ignore "$vmm" >/dev/null 2>&1
+    vm_unlock
     return "$rc"
 }
 
