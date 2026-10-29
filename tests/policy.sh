@@ -58,6 +58,16 @@ echo 'ref: refs/heads/main' > "$R/repo/.git/HEAD"
 expect refused "$R/repo/.git/hooks:rw" "git metadata"
 expect ok "$R/repo:rw" "mount ro $R/repo/.git (stays read-only)"
 
+# A bare repository has no .git component: nothing below it may be rw, since
+# its hooks and config run when git is used there. Read-only is fine.
+mkdir -p "$R/proj.git/hooks" "$R/proj.git/objects" "$R/proj.git/refs"
+echo 'ref: refs/heads/main' > "$R/proj.git/HEAD"
+touch "$R/proj.git/config"
+expect refused "$R/proj.git:rw" "git metadata"
+expect refused "$R/proj.git/hooks:rw" "git metadata"
+expect refused "$R/proj.git/config:rw" "git metadata"
+expect ok "$R/proj.git/hooks:ro"
+
 # Relabelling a hard-linked file would relabel its other links too.
 mkdir -p "$R/hardlink"
 echo x > "$R/hardlink/a"

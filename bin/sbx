@@ -330,6 +330,19 @@ unset n
 # gitdir: it only needs a HEAD file, or a commondir file pointing elsewhere).
 is_git_dir() { [ -f "$1/HEAD" ] || [ -f "$1/commondir" ]; }
 
+# inside_git_dir PATH: PATH or a directory above it is a git directory, so
+# PATH may be its hooks, config or anything else git acts on. Bare
+# repositories have no ".git" component that is_risky_path would catch.
+inside_git_dir() {
+    local d=$1
+    while :; do
+        if is_git_dir "$d"; then return 0; fi
+        [ "$d" != / ] || return 1
+        d=${d%/*}
+        d=${d:-/}
+    done
+}
+
 # risky_entries DIR: NUL-separated paths in DIR that host tools would act on:
 # entries named in RISKY_NAMES and git directories under any name. If DIR
 # itself is a git directory, its HEAD and commondir files are listed, since
@@ -365,7 +378,7 @@ add_mount() {
     check_shareable "$p"
     in_mount_roots "$p" || die "refusing $p: only paths below ${MOUNT_ROOTS//:/, } can be mounted; use --copy"
     if [ "$mode" = rw ]; then
-        if is_risky_path "$p" || is_git_dir "$p"; then
+        if is_risky_path "$p" || inside_git_dir "$p"; then
             die "refusing $p: rw mounts of or inside git metadata or tool configuration are not allowed"
         fi
     fi
