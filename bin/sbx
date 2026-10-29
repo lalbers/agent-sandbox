@@ -139,10 +139,14 @@ require_container_mode() {
 # that `sbx down`, which takes it exclusively, can neither miss a microVM that
 # is about to start nor scan while one runs. Waiting may outlast the session,
 # hence the checks after the lock is held.
+# The fd is inherited by podman, conmon and its cleanup process, which keeps
+# the lock until the microVM is really gone (also if sbx is killed): do not
+# close it for them. It is opened read-only, since the VMM may hold it too.
 vm_lock_shared() {
     mkdir -p "$(dirname "$VM_LOCK")"
-    exec {VM_LOCK_FD}>>"$VM_LOCK"
-    flock -s "$VM_LOCK_FD"
+    : >> "$VM_LOCK"
+    exec {VM_LOCK_FD}<"$VM_LOCK"
+    flock -s "$VM_LOCK_FD" || die "cannot lock $VM_LOCK"
     [ ! -f "$STOPPING" ] || die "the sandbox is being stopped"
     in_vm_mode && [ -f "$VM_ARGS" ] || die "sandbox is not running (sbx up)"
 }
@@ -668,7 +672,8 @@ stop_all() {
     # Every microVM run holds the lock shared (vm_lock_shared). Remove runs
     # until the lock is ours exclusively: then none is left, including one
     # that passed its stopping check just before the flag was set.
-    exec {lock}>>"$VM_LOCK"
+    : >> "$VM_LOCK"
+    exec {lock}<"$VM_LOCK"
     for _ in $(seq 1 30); do
         ids=$(podman ps -aq --filter "label=$VM_LABEL=1" 2>/dev/null) || ids=""
         # shellcheck disable=SC2086  # one container ID per word
