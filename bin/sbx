@@ -211,6 +211,23 @@ read_list() {
     done < "$1"
 }
 
+# find0 ARRAY FIND-ARGS...: run find (which must print with -print0 or a
+# \0-terminated -printf) and store the results in ARRAY. Fails if find reports
+# an error: a directory it cannot read could hide what the caller looks for.
+# find's messages carry file names the sandbox may have chosen, so they are
+# sanitised before they reach the terminal.
+find0() {
+    local -n _find0_out=$1
+    local tmp rc=0
+    shift
+    tmp=$(mktemp) || return 1
+    find "$@" > "$tmp" 2> "$tmp.err" || rc=$?
+    mapfile -d '' -t _find0_out < "$tmp"
+    if [ -s "$tmp.err" ]; then head -n 5 -- "$tmp.err" | sanitize >&2; fi
+    rm -f -- "$tmp" "$tmp.err"
+    return "$rc"
+}
+
 # is_within PATH DIR: PATH is DIR or lies below it.
 is_within() { [ "$1" = "$2" ] || [ "$2" = / ] || [[ $1 == "$2"/* ]]; }
 
@@ -300,7 +317,7 @@ in_mount_roots() {
 # cannot handle: network/FUSE filesystems, nested mount points, hard links
 # (the label would change for the other link, e.g. a key file, too).
 check_relabel_safe() {
-    local p=$1 fstype mounts t hit
+    local p=$1 fstype mounts t hits=()
     fstype=$(stat -f -c %T -- "$p")
     case $fstype in
         cifs|smb2|smb3|nfs|nfs4|fuse*|9p|v9fs) die "refusing $p: $fstype cannot be SELinux-relabelled; use --copy" ;;
@@ -310,8 +327,9 @@ check_relabel_safe() {
         t=$(printf '%b' "$t")
         if [ "$t" != "$p" ] && is_within "$t" "$p"; then die "refusing $p: contains mount point $t; use --copy"; fi
     done <<< "$mounts"
-    hit=$(find "$p" -xdev -type f -links +1 -print -quit 2>/dev/null || true)
-    [ -z "$hit" ] || die "refusing $p: hard-linked file $hit would be relabelled for all its links; use --copy"
+    find0 hits "$p" -xdev -type f -links +1 -print0 -quit \
+        || die "refusing $p: cannot read all of it to check for hard links; use --copy"
+    [ ${#hits[@]} -eq 0 ] || die "refusing $p: hard-linked file ${hits[0]} would be relabelled for all its links; use --copy"
 }
 
 # Names that make host tools run or load something when you work in that
@@ -343,27 +361,29 @@ inside_git_dir() {
     done
 }
 
-# risky_entries DIR: NUL-separated paths in DIR that host tools would act on:
-# entries named in RISKY_NAMES and git directories under any name. If DIR
+# risky_entries DIR: set RISKY to the paths in DIR that host tools would act
+# on: entries named in RISKY_NAMES and git directories under any name. If DIR
 # itself is a git directory, its HEAD and commondir files are listed, since
 # DIR itself cannot be moved. Nested hits inside an earlier hit are left out.
+# Fails if DIR cannot be read completely: what is unreadable now may be a
+# .git the sandbox makes readable again.
 risky_entries() {
-    local f a skip acc=()
-    {
-        find "$1" -xdev -mindepth 1 "${RISKY_FIND[@]}" -prune -print0 2>/dev/null
-        while IFS= read -r -d '' f; do
-            if [ "${f%/*}" = "$1" ]; then printf '%s\0' "$f"; else printf '%s\0' "${f%/*}"; fi
-        done < <(find "$1" -xdev -mindepth 1 -type f \( -name HEAD -o -name commondir \) -print0 2>/dev/null)
-    } | sort -zu | while IFS= read -r -d '' f; do
+    local f a skip named=() gitfiles=() found=()
+    RISKY=()
+    find0 named "$1" -xdev -mindepth 1 "${RISKY_FIND[@]}" -prune -print0 || return 1
+    find0 gitfiles "$1" -xdev -mindepth 1 -type f \( -name HEAD -o -name commondir \) -print0 || return 1
+    found=("${named[@]}")
+    for f in "${gitfiles[@]}"; do
+        if [ "${f%/*}" = "$1" ]; then found+=("$f"); else found+=("${f%/*}"); fi
+    done
+    [ ${#found[@]} -gt 0 ] || return 0
+    while IFS= read -r -d '' f; do
         skip=0
-        for a in "${acc[@]}"; do
+        for a in "${RISKY[@]}"; do
             if is_within "$f" "$a"; then skip=1; break; fi
         done
-        if [ "$skip" = 0 ]; then
-            acc+=("$f")
-            printf '%s\0' "$f"
-        fi
-    done
+        if [ "$skip" = 0 ]; then RISKY+=("$f"); fi
+    done < <(printf '%s\0' "${found[@]}" | LC_ALL=C sort -zu)
 }
 
 # add_mount PATH[:ro|:rw] — validate a bind mount and append it to MOUNT_ARGS.
@@ -391,12 +411,13 @@ add_mount() {
         # Existing entries host tools act on (git metadata of nested repos and
         # submodules too) stay read-only, otherwise the agent could plant hooks
         # or config that run on the host. New ones are reported by scan_outputs.
-        while IFS= read -r -d '' g; do
+        risky_entries "$p" || die "refusing $p: cannot read all of it to find git metadata and tool configuration"
+        for g in "${RISKY[@]}"; do
             [ ! -L "$g" ] || die "refusing $p: $g is a symlink"
             case $g in *[:,]*|*$'\n'*) die "refusing $p: unsupported character in $g" ;; esac
             MOUNT_ARGS+=(-v "$g:/host$g:ro,Z,bind")
             note "mount ro $g (stays read-only)"
-        done < <(risky_entries "$p")
+        done
     fi
 }
 
@@ -459,12 +480,15 @@ is_risky_path() {
 # still running and maybe using them) only lists. Never aborts: a failed step
 # is reported.
 scan_outputs() {
-    local mode=$1 f src rel quarantine n=0 hits=() changed=()
+    local mode=$1 f src rel quarantine n=0 hits=() changed=() list=()
     if [ "$mode" = defuse ]; then
         # The sandbox writes as your UID; reopen directories it locked with chmod.
         chmod -R u+rwX -- "$LAB_OUT" 2>/dev/null || true
     fi
-    while IFS= read -r -d '' f; do
+    # What cannot be read cannot be checked: say so instead of passing it.
+    find0 list "$LAB_OUT" -mindepth 1 ! -type f ! -type d -print0 \
+        || hits+=("lab/out: COULD NOT read everything; do not use it from the host")
+    for f in "${list[@]}"; do
         rel=${f#"$LAB_OUT"/}
         rel=${rel//$'\n'/\\n}
         if [ "$mode" = report ]; then
@@ -474,9 +498,10 @@ scan_outputs() {
         else
             hits+=("lab/out: COULD NOT remove (not a regular file): $rel")
         fi
-    done < <(find "$LAB_OUT" -mindepth 1 ! -type f ! -type d -print0 2>/dev/null)
+    done
     quarantine=$SBX_ROOT/state/quarantine/$(date +%Y%m%d-%H%M%S)
-    while IFS= read -r -d '' f; do
+    risky_entries "$LAB_OUT" || hits+=("lab/out: COULD NOT read everything to find risky entries; do not use it from the host")
+    for f in "${RISKY[@]}"; do
         rel=${f#"$LAB_OUT"/}
         if [ "$mode" = report ]; then
             hits+=("lab/out: ${rel//$'\n'/\\n} (quarantined at sbx down)")
@@ -487,11 +512,13 @@ scan_outputs() {
         else
             hits+=("lab/out: COULD NOT quarantine: ${rel//$'\n'/\\n}")
         fi
-    done < <(risky_entries "$LAB_OUT")
+    done
     # rw mounts of the current session, as recorded by `sbx up`.
     if [ -f "$UP_STAMP" ]; then
         while IFS= read -r src; do
-            while IFS= read -r -d '' f; do
+            find0 list "$src" -xdev -cnewer "$UP_STAMP" ! -type d -print0 \
+                || hits+=("rw mount: COULD NOT read everything in ${src//$'\n'/\\n}; do not use it from the host")
+            for f in "${list[@]}"; do
                 n=$((n + 1))
                 if [ -L "$f" ] || is_risky_path "${f#"$src"}" \
                     || [ "${f##*/}" = HEAD ] || [ "${f##*/}" = commondir ]; then
@@ -499,12 +526,14 @@ scan_outputs() {
                 else
                     changed+=("${f//$'\n'/\\n}")
                 fi
-            done < <(find "$src" -xdev -cnewer "$UP_STAMP" ! -type d -print0 2>/dev/null)
-            while IFS= read -r -d '' f; do
+            done
+            risky_entries "$src" \
+                || hits+=("rw mount: COULD NOT read everything in ${src//$'\n'/\\n} to find new git repositories")
+            for f in "${RISKY[@]}"; do
                 if [ "$(find "$f/HEAD" -cnewer "$UP_STAMP" 2>/dev/null)" ]; then
                     hits+=("rw mount: RISKY new git repository: ${f//$'\n'/\\n}")
                 fi
-            done < <(risky_entries "$src")
+            done
         done < <(session_rw_mounts)
     fi
     if [ ${#changed[@]} -gt 0 ] && [ "$mode" = report ]; then
@@ -1113,11 +1142,18 @@ cmd_selftest() {
 }
 
 cmd_check() {
-    local spec rc=0
+    local spec rc=0 one
     [ $# -gt 0 ] || die "check: PATH[:ro|:rw]..."
     warn_overrides
     for spec in "$@"; do
-        if (MOUNT_ARGS=() MOUNT_SPECS=(); add_mount "$spec") 2>&1; then
+        # Not as an `if` condition or in an && / || list: bash ignores errexit
+        # inside those, so a failing command in add_mount could pass here
+        # while `sbx up` stops on it.
+        set +e
+        (set -e; MOUNT_ARGS=() MOUNT_SPECS=(); add_mount "$spec") 2>&1
+        one=$?
+        set -e
+        if [ "$one" -eq 0 ]; then
             echo "OK       $spec"
         else
             echo "REFUSED  $spec"

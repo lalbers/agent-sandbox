@@ -74,5 +74,15 @@ echo x > "$R/hardlink/a"
 ln "$R/hardlink/a" "$R/hardlink/b"
 expect refused "$R/hardlink:ro" "hard-linked"
 
+# Fail closed: a directory the scan cannot read could hide a hard link or a
+# .git, so the whole mount is refused (ro and rw), never silently accepted.
+if [ "$(id -u)" -ne 0 ]; then
+    mkdir -p "$R/locked/inner/.git"
+    chmod 000 "$R/locked/inner"
+    expect refused "$R/locked:ro" "cannot read"
+    expect refused "$R/locked:rw" "cannot read"
+    chmod 700 "$R/locked/inner"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
