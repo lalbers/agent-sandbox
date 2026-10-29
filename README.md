@@ -177,9 +177,10 @@ show as untrusted. The agent has just read the sample.
 
 ## How this was built
 
-23–25 October 2026, in a private repository. This history starts at the
-import; later commits are follow-up. Where Claude Code (Claude Opus) wrote
-the commit, the commit names Claude as co-author.
+Started on 23 October 2026 as a private project. The first three commits come
+from that repository, with personal paths redacted; the rest is the rework and
+hardening for publication. Where Claude Code (Claude Opus) wrote the commit,
+the commit names Claude as co-author.
 
 ## License
 
