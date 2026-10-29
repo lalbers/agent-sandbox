@@ -21,14 +21,15 @@ def sc(nr, *args):
 
 # probe NAME EXPECTED CODE: CODE must print EXPECTED under the guard, and
 # something else without it. Where the host already refuses the call (Ubuntu's
-# AppArmor policy blocks unprivileged user namespaces, for example), the probe
-# proves nothing and is skipped.
+# AppArmor policy blocks unprivileged user namespaces, for example) or kills
+# the probe outright (an outer seccomp filter), it proves nothing and is
+# skipped.
 probe() {
     local name=$1 want=$2 code=$3 plain got
     plain=$(python3 -I -c "$PRELUDE$code" 2>&1)
     got=$("$GUARD" python3 -I -c "$PRELUDE$code" 2>&1)
-    if [ "$plain" = "$want" ]; then
-        printf 'skip  %-34s the host gives %s without the guard too\n' "$name" "$plain"
+    if [ "$plain" = "$want" ] || [ -z "$plain" ]; then
+        printf 'skip  %-34s the host gives %s without the guard too\n' "$name" "${plain:-nothing}"
     elif [ "$got" = "$want" ]; then
         printf 'ok    %-34s %s (without the guard: %s)\n' "$name" "$got" "$plain"
         pass=$((pass + 1))
@@ -56,12 +57,19 @@ probe "keyctl refused" EPERM "sc(250, 0, -1, 0)"
 probe "io_uring_setup answers ENOSYS" ENOSYS "sc(425, 1, 0)"
 probe "x32 ABI refused" EPERM "sc(0x40000000 | 39)"
 
-# Ordinary work still runs under the guard.
-if "$GUARD" python3 -I -c 'import os, sys; pid = os.fork(); sys.exit(0) if pid == 0 else os.waitpid(pid, 0)' \
-    && "$GUARD" true; then
-    echo "ok    fork and exec work under the guard"; pass=$((pass + 1))
+# Ordinary work still runs under the guard: fork, exec, and threads, which
+# try clone3 first and must fall back to clone on ENOSYS.
+if "$GUARD" python3 -I -c '
+import os, sys
+pid = os.fork()
+if pid == 0:
+    os._exit(7)
+sys.exit(0 if os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 7 else 1)' \
+    && "$GUARD" true \
+    && "$GUARD" python3 -I -c 'import threading; t = threading.Thread(target=lambda: None); t.start(); t.join()'; then
+    echo "ok    fork, exec and threads work under the guard"; pass=$((pass + 1))
 else
-    echo "FAIL  fork or exec fails under the guard"; fail=$((fail + 1))
+    echo "FAIL  fork, exec or threads fail under the guard"; fail=$((fail + 1))
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
