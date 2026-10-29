@@ -1,8 +1,12 @@
 #!/bin/bash
 # Mount-policy tests: run `sbx check` against a scratch mount root. No Podman,
-# no images and no network needed, so this runs anywhere bash and GNU
-# coreutils/findutils do (CI included). Usage: tests/policy.sh
+# no images and no network needed: bash, GNU coreutils/findutils and
+# util-linux (findmnt) are enough, so this runs in CI too. TMPDIR must be a
+# local filesystem outside hidden entries of $HOME. Usage: tests/policy.sh
 set -uo pipefail
+
+# sbx refuses to run as root, so every check would fail for the wrong reason.
+if [ "$(id -u)" -eq 0 ]; then echo "skipped: run as a regular user"; exit 0; fi
 
 SBX=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/bin/sbx
 T=$(mktemp -d "${TMPDIR:-/tmp}/sbx-policy.XXXXXX")
@@ -86,10 +90,11 @@ expect ok "$R/outer:rw" "mount ro $R/outer/link.git (stays read-only)"
 # Other agents' instruction files and other VCS directories are risky too:
 # overlaid read-only inside an rw mount, never rw themselves.
 mkdir -p "$R/agents/.gemini" "$R/agents/.hg"
-touch "$R/agents/AGENTS.md" "$R/agents/.gitmodules"
+touch "$R/agents/AGENTS.md" "$R/agents/.gitmodules" "$R/agents/lefthook.yml"
 expect ok "$R/agents:rw" "mount ro $R/agents/AGENTS.md (stays read-only)"
 expect ok "$R/agents:rw" "mount ro $R/agents/.hg (stays read-only)"
 expect ok "$R/agents:rw" "mount ro $R/agents/.gitmodules (stays read-only)"
+expect ok "$R/agents:rw" "mount ro $R/agents/lefthook.yml (stays read-only)"
 expect refused "$R/agents/.gemini:rw" "tool configuration"
 
 # Names with control characters never reach the terminal or a mount.
@@ -102,19 +107,34 @@ echo x > "$R/hardlink/a"
 ln "$R/hardlink/a" "$R/hardlink/b"
 expect refused "$R/hardlink:ro" "hard-linked"
 
-# Runtime data (agent home, lab/out, transcripts) is never shared again.
+# Runtime data (agent home, lab/out, transcripts) is never shared again, and a
+# mount root inside it is refused.
 expect refused "$SBX_DATA_DIR:ro" "protected path"
 expect refused "$SBX_DATA_DIR/lab/out:rw" "protected path"
+out=$(SBX_MOUNT_ROOTS=$SBX_DATA_DIR/lab "$SBX" check "$R/plain:ro" 2>&1)
+if [[ $out == *"is not allowed"* ]]; then
+    echo "ok    mount root inside the data directory is refused"; pass=$((pass + 1))
+else
+    printf 'FAIL  mount root inside the data directory was accepted\n%s\n' "$out"; fail=$((fail + 1))
+fi
+
+# SBX_DATA_DIR must be an absolute path outside this repository.
+for bad in relative/data "$(dirname "$SBX")/../data"; do
+    out=$(SBX_DATA_DIR=$bad "$SBX" check "$R/plain:ro" 2>&1)
+    if [[ $out == *"SBX_DATA_DIR"* ]] && [[ $out != *"OK  "* ]]; then
+        echo "ok    SBX_DATA_DIR=$bad is refused"; pass=$((pass + 1))
+    else
+        printf 'FAIL  SBX_DATA_DIR=%s was accepted\n%s\n' "$bad" "$out"; fail=$((fail + 1))
+    fi
+done
 
 # Fail closed: a directory the scan cannot read could hide a hard link or a
 # .git, so the whole mount is refused (ro and rw), never silently accepted.
-if [ "$(id -u)" -ne 0 ]; then
-    mkdir -p "$R/locked/inner/.git"
-    chmod 000 "$R/locked/inner"
-    expect refused "$R/locked:ro" "cannot read"
-    expect refused "$R/locked:rw" "cannot read"
-    chmod 700 "$R/locked/inner"
-fi
+mkdir -p "$R/locked/inner/.git"
+chmod 000 "$R/locked/inner"
+expect refused "$R/locked:ro" "cannot read"
+expect refused "$R/locked:rw" "cannot read"
+chmod 700 "$R/locked/inner"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

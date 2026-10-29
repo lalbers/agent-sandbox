@@ -226,14 +226,14 @@ read_list() {
 # sanitised before they reach the terminal.
 find0() {
     local -n _find0_out=$1
-    local tmp rc=0
+    local _find0_dir _find0_rc=0
     shift
-    tmp=$(mktemp) || return 1
-    find "$@" > "$tmp" 2> "$tmp.err" || rc=$?
-    mapfile -d '' -t _find0_out < "$tmp"
-    if [ -s "$tmp.err" ]; then head -n 5 -- "$tmp.err" | sanitize >&2; fi
-    rm -f -- "$tmp" "$tmp.err"
-    return "$rc"
+    _find0_dir=$(mktemp -d) || return 1
+    find "$@" > "$_find0_dir/out" 2> "$_find0_dir/err" || _find0_rc=$?
+    mapfile -d '' -t _find0_out < "$_find0_dir/out"
+    if [ -s "$_find0_dir/err" ]; then head -n 5 -- "$_find0_dir/err" | sanitize >&2; fi
+    rm -rf -- "$_find0_dir"
+    return "$_find0_rc"
 }
 
 # is_within PATH DIR: PATH is DIR or lies below it.
@@ -273,20 +273,36 @@ warn_overrides() {
     if [ "$IMAGE" != "$IMG_REA" ]; then note "image from SBX_IMAGE: $IMAGE"; fi
 }
 
-# Older versions kept the runtime data inside the repository. With "strict"
-# (up, restart) a session recorded there stops sbx: its outputs were never
-# checked. Otherwise, and for leftovers, it is only reported.
+# Older versions kept the runtime data inside the repository; nothing reads
+# it there any more. A session such a version recorded was never checked by
+# this one, so up and restart ("strict") stop until it is dealt with.
 check_old_layout() {
-    local d msg old=()
-    for d in state lab runs logs; do [ ! -e "$SBX_ROOT/$d" ] || old+=("$d"); done
+    local d old=()
+    for d in state lab runs logs; do [ ! -e "$SBX_ROOT/$d" ] || old+=("$SBX_ROOT/$d"); done
     [ ${#old[@]} -gt 0 ] || return 0
     if [ -f "$SBX_ROOT/state/mode" ]; then
-        msg="an older sbx recorded a session in $SBX_ROOT/state whose outputs were never checked: stop it (podman rm -f $CTR $EGRESS), move ${old[*]} from $SBX_ROOT into $(show "$SBX_DATA_DIR") (which must not exist yet), then run sbx down"
+        local msg
+        msg="a session started by an older sbx is recorded in $SBX_ROOT/state, and this version does not check its outputs: stop it with the version that started it (sbx down), or remove its containers and review $SBX_ROOT/lab/out and its rw mounts by hand"
         if [ "$1" = strict ]; then die "$msg"; fi
         note "WARNING: $msg"
         return 0
     fi
-    note "runtime data of an older sbx is still in $SBX_ROOT (${old[*]}); move it to $(show "$SBX_DATA_DIR") or delete it (podman unshare rm -rf)"
+    note "runtime data of an older sbx is still in the repository and no longer used (${old[*]#"$SBX_ROOT"/}); delete it when you no longer need it: podman unshare rm -rf ${old[*]}"
+}
+
+# The data directory is mounted into the sandbox and named in podman -v
+# arguments: it has to be absolute, -v-safe and outside this repository.
+check_data_dir() {
+    case $SBX_DATA_DIR in
+        /*) ;;
+        *) die "SBX_DATA_DIR must be an absolute path: $SBX_DATA_DIR" ;;
+    esac
+    case $SBX_DATA_DIR in
+        *[:,]*|*[[:cntrl:]]*) die "SBX_DATA_DIR must not contain ':', ',' or control characters" ;;
+    esac
+    if is_within "$(realpath -m -- "$SBX_DATA_DIR")" "$SBX_ROOT"; then
+        die "SBX_DATA_DIR must be outside this repository: $SBX_DATA_DIR"
+    fi
 }
 
 # Print why PATH must never be shared with the sandbox; print nothing if it may.
@@ -364,14 +380,17 @@ check_relabel_safe() {
 
 # Names that make host tools run or load something when you work in that
 # directory later: git (hooks, core.fsmonitor, submodules, attributes),
-# Mercurial and Jujutsu, direnv, Claude Code project settings, hooks and
+# Mercurial, Jujutsu and darcs, direnv, Claude Code project settings, hooks and
 # memory, other coding agents' instructions and settings, MCP configs, editor
-# tasks, pre-commit, package manager and toolchain configuration that can name
-# commands to run.
-RISKY_NAMES=(.git .gitmodules .gitattributes .hg .jj .envrc .claude .mcp.json CLAUDE.md
-             CLAUDE.local.md AGENTS.md GEMINI.md .gemini .cursor .cursorrules .husky .vscode
-             .idea .devcontainer .pre-commit-config.yaml .github .npmrc .yarnrc .yarnrc.yml
-             .cargo .mvn mise.toml .mise.toml)
+# tasks, git hook managers, package manager and toolchain configuration that
+# can name commands to run.
+RISKY_NAMES=(.git .gitmodules .gitattributes .hg .jj _darcs .envrc .claude .mcp.json
+             CLAUDE.md CLAUDE.local.md AGENTS.md GEMINI.md .gemini .cursor .cursorrules
+             .codex .aider.conf.yml .clinerules .windsurfrules .continue .kiro .opencode
+             opencode.json .husky lefthook.yml .lefthook.yml .pre-commit-config.yaml
+             .vscode .idea .zed .devcontainer .github .npmrc .yarnrc .yarnrc.yml
+             .pnpmfile.cjs bunfig.toml .cargo rust-toolchain rust-toolchain.toml .mvn
+             mise.toml .mise.toml)
 RISKY_FIND=()
 for n in "${RISKY_NAMES[@]}"; do RISKY_FIND+=(-o -name "$n"); done
 RISKY_FIND=("(" "${RISKY_FIND[@]:1}" ")")
@@ -402,22 +421,30 @@ inside_git_dir() {
 # Fails if DIR cannot be read completely: what is unreadable now may be a
 # .git the sandbox makes readable again.
 risky_entries() {
-    local f a skip named=() gitfiles=() found=()
+    local f a skip rc=0 named=() gitfiles=() found=() sorted=()
     RISKY=()
-    find0 named "$1" -xdev -mindepth 1 "${RISKY_FIND[@]}" -prune -print0 || return 1
-    find0 gitfiles "$1" -xdev -mindepth 1 \( -type f -o -type l \) \( -name HEAD -o -name commondir \) -print0 || return 1
+    # On a read error, RISKY still gets what was found, so that sbx down can
+    # quarantine it; the caller learns from the status that it is incomplete.
+    find0 named "$1" -xdev -mindepth 1 "${RISKY_FIND[@]}" -prune -print0 || rc=1
+    find0 gitfiles "$1" -xdev -mindepth 1 \( -type f -o -type l \) \( -name HEAD -o -name commondir \) -print0 || rc=1
     found=("${named[@]}")
     for f in "${gitfiles[@]}"; do
         if [ "${f%/*}" = "$1" ]; then found+=("$f"); else found+=("${f%/*}"); fi
     done
-    [ ${#found[@]} -gt 0 ] || return 0
-    while IFS= read -r -d '' f; do
+    [ ${#found[@]} -gt 0 ] || return "$rc"
+    # Sorted, so a parent comes before what lies below it.
+    f=$(mktemp) || return 1
+    if ! printf '%s\0' "${found[@]}" | LC_ALL=C sort -zu > "$f"; then rm -f -- "$f"; return 1; fi
+    mapfile -d '' -t sorted < "$f"
+    rm -f -- "$f"
+    for f in "${sorted[@]}"; do
         skip=0
         for a in "${RISKY[@]}"; do
             if is_within "$f" "$a"; then skip=1; break; fi
         done
         if [ "$skip" = 0 ]; then RISKY+=("$f"); fi
-    done < <(printf '%s\0' "${found[@]}" | LC_ALL=C sort -zu)
+    done
+    return "$rc"
 }
 
 # add_mount PATH[:ro|:rw] — validate a bind mount and append it to MOUNT_ARGS.
@@ -479,7 +506,7 @@ check_copy() {
         fi
     done < <(session_rw_mounts)
     name=$(basename -- "$src")
-    [ ! -e "$LAB_IN/$name" ] || die "lab/in/$name already exists; remove it there first"
+    [ ! -e "$LAB_IN/$name" ] || die "$(show "$LAB_IN")/$name already exists; remove it there first"
     printf '%s\n' "$src"
 }
 
@@ -521,8 +548,10 @@ scan_outputs() {
         chmod -R u+rwX -- "$LAB_OUT" 2>/dev/null || true
     fi
     # What cannot be read cannot be checked: say so instead of passing it.
-    find0 list "$LAB_OUT" -mindepth 1 ! -type f ! -type d -print0 \
-        || hits+=("lab/out: COULD NOT read everything; do not use it from the host")
+    # Without lab/out no session has written anything there yet.
+    if [ -d "$LAB_OUT" ] && ! find0 list "$LAB_OUT" -mindepth 1 ! -type f ! -type d -print0; then
+        hits+=("lab/out: COULD NOT read everything; do not use it from the host")
+    fi
     for f in "${list[@]}"; do
         rel=${f#"$LAB_OUT"/}
         rel=${rel//$'\n'/\\n}
@@ -535,7 +564,10 @@ scan_outputs() {
         fi
     done
     quarantine=$SBX_DATA_DIR/state/quarantine/$(date +%Y%m%d-%H%M%S)
-    risky_entries "$LAB_OUT" || hits+=("lab/out: COULD NOT read everything to find risky entries; do not use it from the host")
+    RISKY=()
+    if [ -d "$LAB_OUT" ] && ! risky_entries "$LAB_OUT"; then
+        hits+=("lab/out: COULD NOT read everything to find risky entries; do not use it from the host")
+    fi
     for f in "${RISKY[@]}"; do
         rel=${f#"$LAB_OUT"/}
         if [ "$mode" = report ]; then
@@ -1203,6 +1235,7 @@ main() {
     local cmd=${1:-help} p
     [ "$(id -u)" -ne 0 ] || die "refusing to run as root: rootless podman is the isolation boundary"
     if [ $# -gt 0 ]; then shift; fi
+    case $cmd in help|-h|--help) ;; *) check_data_dir ;; esac
     # Commands that share host paths load the policy here, in the main shell,
     # so a broken config stops them before any check runs.
     case $cmd in up|restart|check|in) load_policy ;; esac
