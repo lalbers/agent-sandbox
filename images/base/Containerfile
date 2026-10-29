@@ -69,7 +69,7 @@ RUN chmod 0755 /usr/local/bin/sbx-entrypoint /usr/local/bin/sbx-claude /usr/loca
 RUN set -o pipefail \
     && find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
     && find / -xdev -type f -perm /111 -print0 | xargs -0 getcap \
-        | awk '{print $1}' | xargs -r setcap -r \
+        | awk '{print $1}' | xargs -r -n1 setcap -r \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
     && test -z "$(find / -xdev -type f -perm /111 -print0 | xargs -0 getcap)"
 
