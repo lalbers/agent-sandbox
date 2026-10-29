@@ -205,7 +205,7 @@ show as untrusted. The agent has just read the sample.
   confinement, network refusals (including IPv6 and other spellings of
   loopback), the DNS-leak counter, mounts and, in vm mode, the VMM process.
 - CI runs ShellCheck, both test scripts, hadolint and a squid parse of both
-  egress configurations on every push.
+  egress configurations on pushes to main and on pull requests.
 
 ## Responsible use
 

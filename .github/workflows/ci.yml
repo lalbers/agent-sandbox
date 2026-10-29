@@ -18,8 +18,9 @@ jobs:
           persist-credentials: false
       - name: ShellCheck
         run: |
-          shellcheck --version | head -n 2
-          shellcheck bin/sbx tests/*.sh container/sbx-entrypoint container/sbx-claude \
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt \
+            docker.io/koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d \
+            bin/sbx tests/policy.sh tests/guard.sh container/sbx-entrypoint container/sbx-claude \
             container/sbx-selftest egress/egress-entrypoint host/install-krun.sh
       - name: JSON and Python syntax
         run: |
@@ -46,6 +47,8 @@ jobs:
               hadolint --config /cfg.yaml - < "$f"
           done
       - name: Build the egress image and parse both squid configurations
+        # `shell: bash` adds pipefail, so a failing parse is not lost in tee.
+        shell: bash
         run: |
           fedora=$(sed -n 's/^FEDORA_IMAGE=//p' versions.env)
           docker build -q -t sbx-egress-ci --build-arg "FEDORA_IMAGE=$fedora" \
@@ -54,5 +57,8 @@ jobs:
             echo "== $mode"
             docker run --rm --entrypoint /usr/sbin/squid sbx-egress-ci \
               -k parse -f "/etc/squid/sbx/$mode.conf" 2>&1 | tee "parse-$mode.log"
-            ! grep -Eq 'ERROR|FATAL' "parse-$mode.log"
+            if grep -Eq 'ERROR|FATAL' "parse-$mode.log"; then
+              echo "::error::squid reports errors in $mode.conf"
+              exit 1
+            fi
           done
