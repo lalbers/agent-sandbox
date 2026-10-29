@@ -46,6 +46,12 @@ expect refused "$R/link:ro" "only paths below"
 mkdir -p "$R/a:b"
 expect refused "$R/a:b:ro" "not supported"
 
+# A trailing newline must not be dropped: "nl<LF>" is a directory below the
+# root, "nl" a symlink to somewhere else that podman would end up mounting.
+mkdir -p "$R/nl"$'\n'
+ln -s "$T/outside" "$R/nl"
+expect refused "$R/nl"$'\n'":ro" "not supported"
+
 # Git metadata in a worktree: never rw itself, overlaid read-only otherwise.
 mkdir -p "$R/repo/.git/hooks"
 echo 'ref: refs/heads/main' > "$R/repo/.git/HEAD"

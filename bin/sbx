@@ -261,7 +261,11 @@ deny_reason() {
 # Canonical path with symlinks resolved, or die.
 resolve_path() {
     local p
-    p=$(realpath -e -- "$1" 2>/dev/null) || die "path does not exist: $1"
+    # $(...) drops trailing newlines, which would turn "x<LF>" into "x", a
+    # different path that may be a symlink elsewhere. The sentinel keeps them.
+    p=$(realpath -e -- "$1" 2>/dev/null && printf x) || die "path does not exist: $1"
+    p=${p%x}
+    p=${p%$'\n'}
     case $p in *[:,]*|*$'\n'*) die "paths containing ':', ',' or a newline are not supported: $p" ;; esac
     printf '%s\n' "$p"
 }
