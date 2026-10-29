@@ -27,7 +27,8 @@ RUN dnf -y install --setopt=install_weak_deps=False \
     && dnf clean all && rm -rf /var/cache/dnf
 
 # Temurin JDK 21, checksum-verified.
-RUN curl -fsSL -o /tmp/jdk.tar.gz "$JDK_URL" \
+RUN set -o pipefail \
+    && curl -fsSL -o /tmp/jdk.tar.gz "$JDK_URL" \
     && echo "$JDK_SHA256  /tmp/jdk.tar.gz" | sha256sum -c - \
     && mkdir -p /opt/jdk \
     && tar -xzf /tmp/jdk.tar.gz -C /opt/jdk --strip-components=1 \
@@ -35,7 +36,8 @@ RUN curl -fsSL -o /tmp/jdk.tar.gz "$JDK_URL" \
     && /opt/jdk/bin/java -version
 
 # Ghidra, checksum-verified.
-RUN curl -fsSL -o /tmp/ghidra.zip "$GHIDRA_URL" \
+RUN set -o pipefail \
+    && curl -fsSL -o /tmp/ghidra.zip "$GHIDRA_URL" \
     && echo "$GHIDRA_SHA256  /tmp/ghidra.zip" | sha256sum -c - \
     && unzip -q /tmp/ghidra.zip -d /opt \
     && mv "/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra \
@@ -43,7 +45,8 @@ RUN curl -fsSL -o /tmp/ghidra.zip "$GHIDRA_URL" \
 
 # mitmproxy in its own venv: the wheel is checked against the pinned hash,
 # dependencies come as prebuilt wheels only (no build scripts).
-RUN python3 -m venv /opt/mitmproxy \
+RUN set -o pipefail \
+    && python3 -m venv /opt/mitmproxy \
     && /opt/mitmproxy/bin/pip download --quiet --no-deps --only-binary :all: -d /tmp/mitm \
         "mitmproxy==${MITMPROXY_VERSION}" \
     && echo "$MITMPROXY_WHEEL_SHA256  /tmp/mitm/mitmproxy-${MITMPROXY_VERSION}-py3-none-any.whl" | sha256sum -c - \
@@ -69,9 +72,14 @@ RUN cat /tmp/CLAUDE-rea.md >> /etc/claude-code/CLAUDE.md \
     && echo "rea=${REA_VERSION} ghidra=${GHIDRA_VERSION}" >> /opt/claude-sbx/skel/.sbx-skel-version
 
 # Same as in the base image, for the packages added here.
-RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
-    && find / -xdev -type f -perm /111 -print0 | xargs -0 getcap 2>/dev/null \
-        | awk '{print $1}' | xargs -r setcap -r
+# pipefail and the final checks: a failing find or getcap must not leave
+# privileges behind while the build looks fine.
+RUN set -o pipefail \
+    && find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
+    && find / -xdev -type f -perm /111 -print0 | xargs -0 getcap \
+        | awk '{print $1}' | xargs -r setcap -r \
+    && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
+    && test -z "$(find / -xdev -type f -perm /111 -print0 | xargs -0 getcap)"
 
 LABEL org.opencontainers.image.title="claude-sbx-rea" \
       sbx.rea.version="${REA_VERSION}" \

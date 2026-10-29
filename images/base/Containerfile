@@ -30,7 +30,8 @@ RUN dnf -y update && dnf -y install --setopt=install_weak_deps=False \
 
 # Node.js from nodejs.org, checksum-verified, into /usr/local (so npm's global
 # prefix, and with it `claude` and `rea`, is /usr/local as well).
-RUN curl -fsSL -o /tmp/node.tar.xz \
+RUN set -o pipefail \
+    && curl -fsSL -o /tmp/node.tar.xz \
         "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
     && echo "$NODE_SHA256  /tmp/node.tar.xz" | sha256sum -c - \
     && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
@@ -63,9 +64,14 @@ RUN chmod 0755 /usr/local/bin/sbx-entrypoint /usr/local/bin/sbx-claude /usr/loca
 # No setuid/setgid binaries and no file capabilities: nothing in the sandbox
 # may gain privileges by exec (matters in the microVM guest, whose kernel does
 # not enforce the container's no_new_privs before sbx-guard runs).
-RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
-    && find / -xdev -type f -perm /111 -print0 | xargs -0 getcap 2>/dev/null \
-        | awk '{print $1}' | xargs -r setcap -r
+# pipefail and the final checks: a failing find or getcap must not leave
+# privileges behind while the build looks fine.
+RUN set -o pipefail \
+    && find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
+    && find / -xdev -type f -perm /111 -print0 | xargs -0 getcap \
+        | awk '{print $1}' | xargs -r setcap -r \
+    && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
+    && test -z "$(find / -xdev -type f -perm /111 -print0 | xargs -0 getcap)"
 
 LABEL org.opencontainers.image.title="claude-sbx-base" \
       sbx.claude-code.version="${CLAUDE_CODE_VERSION}" \
