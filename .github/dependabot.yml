@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # The image pins (Fedora digest, Node.js, Claude Code, REA, Ghidra, JDK,
+  # mitmproxy) live in versions.env with their SHA-256 sums and are bumped by
+  # hand; Dependabot cannot follow them. It keeps the CI actions current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

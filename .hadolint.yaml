@@ -1,0 +1,11 @@
+# hadolint settings for images/*/Containerfile (CI fails on warnings).
+failure-threshold: warning
+ignored:
+  # Fedora packages are deliberately unpinned: the base image is pinned by
+  # digest, `dnf -y update` pulls current fixes (README, Limits).
+  - DL3041
+  # RUN steps with a pipe start with `set -o pipefail`. /bin/sh is bash in
+  # Fedora, and podman's default OCI image format ignores a SHELL instruction,
+  # so the option is set inline, which hadolint does not recognise.
+  - DL4006
+  - SC3040

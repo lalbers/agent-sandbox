@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: ShellCheck
+        run: |
+          shellcheck --version | head -n 2
+          shellcheck bin/sbx tests/*.sh container/sbx-entrypoint container/sbx-claude \
+            container/sbx-selftest egress/egress-entrypoint host/install-krun.sh
+      - name: JSON and Python syntax
+        run: |
+          for f in container/*.json rea/mcp.json; do jq empty "$f"; done
+          python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' container/sbx-guard
+      - name: Mount-policy tests
+        run: tests/policy.sh
+      - name: sbx-guard seccomp tests
+        run: tests/guard.sh
+
+  containerfiles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: hadolint
+        run: |
+          for f in images/*/Containerfile; do
+            echo "== $f"
+            docker run --rm -i -v "$PWD/.hadolint.yaml:/cfg.yaml:ro" \
+              docker.io/hadolint/hadolint:v2.15.1-debian@sha256:9a3944b7fddcb947d1ffd90829ac1a6e5c30479223358f249d8b96c7d0019e27 \
+              hadolint --config /cfg.yaml - < "$f"
+          done
+      - name: Build the egress image and parse both squid configurations
+        run: |
+          fedora=$(sed -n 's/^FEDORA_IMAGE=//p' versions.env)
+          docker build -q -t sbx-egress-ci --build-arg "FEDORA_IMAGE=$fedora" \
+            -f images/egress/Containerfile .
+          for mode in api open; do
+            echo "== $mode"
+            docker run --rm --entrypoint /usr/sbin/squid sbx-egress-ci \
+              -k parse -f "/etc/squid/sbx/$mode.conf" 2>&1 | tee "parse-$mode.log"
+            ! grep -Eq 'ERROR|FATAL' "parse-$mode.log"
+          done
