@@ -649,6 +649,10 @@ ensure_networks() {
     [ "$(podman network inspect -f '{{.Internal}} {{.DNSEnabled}}' "$NET_INT")" = "true false" ] \
         || die "network $NET_INT must be --internal without DNS; remove it (podman network rm $NET_INT)"
     podman network exists "$NET_EXT" || podman network create "$NET_EXT" >/dev/null
+    # Global IPv6 addresses of the host and LAN cannot be refused by range;
+    # the proxy's outside network therefore has no IPv6 at all.
+    [ "$(podman network inspect -f '{{.IPv6Enabled}}' "$NET_EXT")" = false ] \
+        || die "network $NET_EXT must not have IPv6; remove it (podman network rm $NET_EXT)"
 }
 
 save_egress_log() {
