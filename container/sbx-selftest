@@ -25,6 +25,7 @@ while [ $# -gt 0 ]; do
 done
 mode=${SBX_NET:-none}
 
+# shellcheck disable=SC2016,SC2329  # $1/$2 are the inner bash's; called via expect_fail
 tcp_connect() { timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2"; }
 # Status from the target ("000" = no response from it) and of the proxy CONNECT.
 http_code()    { curl -s -o /dev/null --max-time 20 -w '%{http_code}' "$@"; }
@@ -69,6 +70,7 @@ sys.exit(0 if libc.syscall(435, 0, 0) == -1 and ctypes.get_errno() == 38 else 1)
 suid=$(find / -xdev -type f -perm /6000 -print -quit 2>/dev/null)
 if [ -z "$suid" ]; then pass "no setuid/setgid binaries"; else fail "setuid/setgid binary present: $suid"; fi
 expect_fail "root filesystem is read-only" touch /usr/.sbx-selftest
+# shellcheck disable=SC2016  # expanded by the inner bash
 expect_ok "home is writable" bash -c ': > "$HOME/.sbx-selftest" && rm -f "$HOME/.sbx-selftest"'
 
 echo "== host data"
@@ -130,6 +132,7 @@ while read -r _ _ _ _ mnt opts _; do
     if [ "$m" = ro ] && [ -d "$mnt" ]; then
         expect_fail "write refused in $mnt" touch "$mnt/.sbx-selftest"
     elif [ "$m" = ro ]; then
+        # shellcheck disable=SC2016  # $1 is the inner bash's
         expect_fail "write refused on $mnt" bash -c ': >> "$1"' _ "$mnt"
     fi
 done < /proc/self/mountinfo
@@ -137,6 +140,7 @@ for p in "${expect_ro[@]}"; do
     if [ -d "$p" ]; then
         expect_fail "write refused in $p" touch "$p/.sbx-selftest"
     elif [ -e "$p" ]; then
+        # shellcheck disable=SC2016  # $1 is the inner bash's
         expect_fail "write refused on $p" bash -c ': >> "$1"' _ "$p"
     else
         fail "expected read-only path missing: $p"
@@ -145,6 +149,7 @@ done
 
 echo "== tools"
 for cmd in "claude --version" "node --version" "rea --version" "java -version" "chromium-browser --version"; do
+    # shellcheck disable=SC2086  # split the command line into words on purpose
     set -- $cmd
     if command -v "$1" >/dev/null; then info "$cmd: $("$@" 2>&1 | head -n 1)"; fi
 done
