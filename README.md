@@ -1,5 +1,7 @@
 # agent-sandbox
 
+[![CI](https://github.com/lalbers/agent-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/lalbers/agent-sandbox/actions/workflows/ci.yml)
+
 `sbx` runs Claude Code and [REA](https://github.com/morluto/rea) in rootless
 Podman. REA is an MCP server for reverse engineering: it parses untrusted
 binaries with Ghidra, it can run a target under Frida, and the strings it
@@ -10,8 +12,10 @@ Claude Code's Bash sandbox covers shell commands. It does not cover MCP
 servers, hooks or other helper processes. On the host those run as you, so
 they can read `~/.ssh`, the claude.ai login and its connectors, and the LAN.
 
-Personal lab. Tested on Fedora 44 (x86_64), rootless Podman 5, SELinux
-enforcing. Versions in `versions.env` are bumped by hand.
+A hardened harness for analysing untrusted binaries with an AI agent,
+maintained by one person. Tested on Fedora 44 (x86_64), rootless Podman 5 and
+SELinux enforcing; other setups are untested. Versions in `versions.env` are
+bumped by hand.
 
 ## Threat model
 
@@ -188,6 +192,33 @@ From a Claude Code session on the host, every `sbx` call has to run outside
 that session's own sandbox. Rootless Podman does not work inside it. Treat
 what `sbx ask`, `sbx screen`, `sbx cat`, `sbx sh`, `sbx tui` and `sbx attach`
 show as untrusted. The agent has just read the sample.
+
+## Testing
+
+- `tests/policy.sh` checks the mount policy through `sbx check` against a
+  scratch directory: symlinks, git directories (bare, symlinked `HEAD`,
+  linked worktrees), risky names, unreadable directories, hard links,
+  control characters and the data directory. No Podman needed.
+- `tests/guard.sh` runs probes under `sbx-guard` and compares the kernel's
+  answers with and without the seccomp filter.
+- `sbx selftest` checks a running sandbox from inside and from the host:
+  confinement, network refusals (including IPv6 and other spellings of
+  loopback), the DNS-leak counter, mounts and, in vm mode, the VMM process.
+- CI runs ShellCheck, both test scripts, hadolint and a squid parse of both
+  egress configurations on every push.
+
+## Responsible use
+
+- Analyse only software you are allowed to analyse and to share with the
+  model provider: everything the agent reads goes to Anthropic, and
+  Anthropic's Usage Policy applies to what you ask it to do.
+- Keep `--net api` or `none` for live malware. `open` lets the sample's
+  traffic reach the internet.
+- Use `--vm` whenever the target executes; container mode shares the host
+  kernel.
+- This is a research tool, not a malware-analysis service. It comes without
+  warranty (see the license). Report vulnerabilities as described in
+  [SECURITY.md](SECURITY.md).
 
 ## How this was built
 
