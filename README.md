@@ -71,9 +71,9 @@ host (rootless Podman, SELinux enforcing)
 
 | Layer | What it does |
 | --- | --- |
-| Credentials | `claude setup-token` only: model requests, no claude.ai connectors, no Remote Control. Podman secret, injected only into the agent's environment. REA starts without it. |
+| Credentials | `claude setup-token` only: model requests, no claude.ai connectors, no Remote Control. Podman secret, injected only into the agent's environment. REA does not inherit it, but runs as the same user and could read it from `/proc`. |
 | Container | Rootless (your UID mapped to the sandbox user). No capabilities, `no_new_privs`, SELinux `container_t`, read-only root, no host sockets (Wayland, D-Bus, Podman, ssh-agent). No setuid/setgid binaries or file capabilities. Container mode uses `SBX_CPUS` (default 4) and `SBX_MEMORY` (default 8g). The sandbox and each microVM allow 4096 processes. A microVM's guest RAM is `SBX_MEMORY`; the VMM cgroup limit is 1g higher. The proxy is capped at 512m and 256 processes. Seccomp starts from Podman's default, which allows `unshare` and `clone` with `CLONE_NEWUSER` so nested containers work. The profile `sbx` writes drops new namespaces and keyring calls, on the sandbox and on the proxy. Docker's default drops new namespaces too. |
-| Agent | `bypassPermissions` is on, so Claude does not ask before a tool call. Only the image's MCP configuration and hooks are loaded. `api` mode turns WebFetch and WebSearch off. Each session resets the agent home to the image and keeps transcripts, so a hook, `CLAUDE.md`, a skill or a poisoned npm cache cannot carry into the next session. |
+| Agent | `bypassPermissions` is on, so Claude does not ask before a tool call. Only the image's MCP configuration and hooks are loaded. `api` mode turns Claude Code's WebFetch and WebSearch off; the API's own server-side tools stay reachable with the token (see Limits). Each session resets the agent home to the image and keeps transcripts, so a hook, `CLAUDE.md`, a skill or a poisoned npm cache cannot carry into the next session. |
 | Network | No route and no DNS in the sandbox. Traffic goes through squid. `api` is the default and allows only `api.anthropic.com`. The allowlist is `dstdomain -n` and it runs before any rule that resolves a name. An earlier config evaluated squid's `dst` ACL first, and that lookup let `secret.attacker.example` reach the attacker's nameserver in `api` mode. `sbx selftest` compares the proxy's UDP counters around requests for random names. `open` allows public destinations on ports 80 and 443. Both modes refuse private, loopback, link-local (cloud metadata), multicast and NAT64. `none` has no network: Claude cannot run, `sbx sh` still works. |
 | Mounts | Read-only by default, only below `mount-roots`. Paths outside the roots can only be copied in. On a writable mount, existing risky entries are bind-mounted read-only, and those paths cannot themselves be mounted writable: `.git` and other git directories, `.gitmodules`, `.gitattributes`, Mercurial and Jujutsu directories, `.claude`, `CLAUDE.md`, `CLAUDE.local.md`, other coding agents' instructions (`AGENTS.md`, `GEMINI.md`, `.gemini`, `.cursor`, `.cursorrules`), `.mcp.json`, `.envrc`, editor, pre-commit, package-manager and toolchain configuration. Hooks already in a mounted repo stay read-only. A new file beside them is created on the host. |
 | Outputs | `sbx down` stops the sandbox, then scans. In `lab/out` it deletes symlinks and special files and moves risky entries to `state/quarantine` in the data directory, with all permissions removed. On a writable mount it lists every file the sandbox changed and flags risky names and new git repositories. The scan uses ctime. Podman's `:z`/`:Z` relabel bumps ctime, so the stamp is written after the relabel; microVM runs share a fixed MCS level and do not relabel again. `sbx ask`, `cat`, `screen`, `egress` and `selftest` strip control characters and bidi controls before printing. `sbx sh` does not. `tui` and `attach` are a live terminal and are not filtered. |
@@ -98,7 +98,12 @@ host (rootless Podman, SELinux enforcing)
 - The agent can read its token from `/proc`. `api.anthropic.com` also accepts
   someone else's API key, so a prompt-injected agent can send data, including
   the token, to another Anthropic organisation. In `open` mode anything can
-  leave. Revoke the token if you are unsure. Podman's secret store keeps the
+  leave. Revoke the token if you are unsure.
+- `api` mode limits where the sandbox connects, not what the API does on its
+  behalf. With the token or any API key, a request can use Anthropic's
+  server-side tools, such as web search, and those reach the internet from
+  Anthropic's side. Treat `api` mode as "data can leave through Anthropic",
+  not as offline. Podman's secret store keeps the
   token unencrypted, mode 0600, in your container storage.
 - squid's ACLs keep the sandbox's requests off private addresses. squid itself
   runs in a normal network namespace, so a compromised proxy can reach the LAN.
