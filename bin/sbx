@@ -35,23 +35,27 @@ CPUS=${SBX_CPUS:-4}
 # One path per line, `#` starts a comment, a leading ~/ means $HOME.
 SBX_CONFIG_DIR=${SBX_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-sandbox}
 
-STATE_HOME=$SBX_ROOT/state/home
-LAST_UP=$SBX_ROOT/state/last-up
-UP_STAMP=$SBX_ROOT/state/up-stamp
-MODE_FILE=$SBX_ROOT/state/mode         # "container|vm NET" while a session is up
-VM_ARGS=$SBX_ROOT/state/vm-args        # podman run args + image for microVM runs
-STOPPING=$SBX_ROOT/state/stopping      # set while `sbx down` runs: no new microVMs
+# Runtime data is outside the repository as well. The sandbox writes its home,
+# lab/out and the transcripts in runs/; none of that may land where a host
+# Claude Code session or git works on this repository.
+SBX_DATA_DIR=${SBX_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-sandbox}
+STATE_HOME=$SBX_DATA_DIR/state/home
+LAST_UP=$SBX_DATA_DIR/state/last-up
+UP_STAMP=$SBX_DATA_DIR/state/up-stamp
+MODE_FILE=$SBX_DATA_DIR/state/mode         # "container|vm NET" while a session is up
+VM_ARGS=$SBX_DATA_DIR/state/vm-args        # podman run args + image for microVM runs
+STOPPING=$SBX_DATA_DIR/state/stopping      # set while `sbx down` runs: no new microVMs
 VM_LABEL=sbx.vm
 # Fixed SELinux MCS categories for microVM runs: each run is a new container,
 # a stable level keeps relabelling a no-op (stable ctimes for scan_outputs)
 # while other containers on the host still cannot access these files.
 VM_LEVEL=s0:c701,c702
-SECCOMP=$SBX_ROOT/state/seccomp.json
+SECCOMP=$SBX_DATA_DIR/state/seccomp.json
 SECCOMP_DEFAULT=/usr/share/containers/seccomp.json
-LAB_IN=$SBX_ROOT/lab/in
-LAB_OUT=$SBX_ROOT/lab/out
-RUNS=$SBX_ROOT/runs
-LOGS=$SBX_ROOT/logs
+LAB_IN=$SBX_DATA_DIR/lab/in
+LAB_OUT=$SBX_DATA_DIR/lab/out
+RUNS=$SBX_DATA_DIR/runs
+LOGS=$SBX_DATA_DIR/logs
 
 usage() {
     cat <<'EOF'
@@ -66,7 +70,7 @@ Lifecycle
                                  --vm: every command runs in a fresh libkrun microVM
                                  (own guest kernel; for executing untrusted targets)
   sbx restart                    recreate with the last --net/--vm/--mount options (e.g. after token set)
-  sbx down                       stop, check outputs, remove (the proxy log is saved to logs/)
+  sbx down                       stop, check outputs, remove (the proxy log is saved to DATA/logs)
   sbx status
   sbx reset [--yes]              wipe the sandbox home (Claude session transcripts)
 
@@ -74,7 +78,8 @@ Files
   sbx in PATH...                 copy into /lab/in (read-only inside the sandbox)
   sbx check PATH[:ro|:rw]...     dry-run the mount policy
   sbx cat FILE                   print a result, read inside the sandbox (safe while it runs)
-  Results: lab/out (= /lab/out), checked and defused by `sbx down`. Transcripts: runs/.
+  Results: DATA/lab/out (= /lab/out), checked and defused by `sbx down`. Transcripts: DATA/runs.
+  DATA is the data directory, ~/.local/state/agent-sandbox (SBX_DATA_DIR).
 
 Driving Claude
   sbx ask [--resume ID|--continue] [--model M] [--cwd DIR] [--raw] PROMPT | -
@@ -98,11 +103,14 @@ In rw mounts, existing .git, .claude, .envrc and similar entries stay read-only;
 `sbx down` lists every file the sandbox changed there. Extra protected paths:
 ~/.config/agent-sandbox/deny-paths.
 Environment: SBX_IMAGE, SBX_MEMORY (8g), SBX_CPUS (4), SBX_MOUNT_ROOTS (overrides
-mount-roots, colon-separated), SBX_CONFIG_DIR.
+mount-roots, colon-separated), SBX_CONFIG_DIR, SBX_DATA_DIR.
 EOF
 }
 
 die()  { printf 'sbx: %s\n' "$*" >&2; exit 1; }
+# show PATH: PATH for messages, with your home written as ~.
+# shellcheck disable=SC2088  # the ~ is meant literally
+show() { case $1 in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
 note() { printf 'sbx: %s\n' "$*" >&2; }
 need_arg() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"; }
 exists() { podman container exists "$1"; }
@@ -259,7 +267,26 @@ warn_overrides() {
     if [ "$SBX_CONFIG_DIR" != "${XDG_CONFIG_HOME:-$HOME/.config}/agent-sandbox" ]; then
         note "config from SBX_CONFIG_DIR: $SBX_CONFIG_DIR"
     fi
+    if [ "$SBX_DATA_DIR" != "${XDG_STATE_HOME:-$HOME/.local/state}/agent-sandbox" ]; then
+        note "data from SBX_DATA_DIR: $SBX_DATA_DIR"
+    fi
     if [ "$IMAGE" != "$IMG_REA" ]; then note "image from SBX_IMAGE: $IMAGE"; fi
+}
+
+# Older versions kept the runtime data inside the repository. With "strict"
+# (up, restart) a session recorded there stops sbx: its outputs were never
+# checked. Otherwise, and for leftovers, it is only reported.
+check_old_layout() {
+    local d msg old=()
+    for d in state lab runs logs; do [ ! -e "$SBX_ROOT/$d" ] || old+=("$d"); done
+    [ ${#old[@]} -gt 0 ] || return 0
+    if [ -f "$SBX_ROOT/state/mode" ]; then
+        msg="an older sbx recorded a session in $SBX_ROOT/state whose outputs were never checked: stop it (podman rm -f $CTR $EGRESS), move ${old[*]} from $SBX_ROOT into $(show "$SBX_DATA_DIR") (which must not exist yet), then run sbx down"
+        if [ "$1" = strict ]; then die "$msg"; fi
+        note "WARNING: $msg"
+        return 0
+    fi
+    note "runtime data of an older sbx is still in $SBX_ROOT (${old[*]}); move it to $(show "$SBX_DATA_DIR") or delete it (podman unshare rm -rf)"
 }
 
 # Print why PATH must never be shared with the sandbox; print nothing if it may.
@@ -268,7 +295,7 @@ deny_reason() {
     load_policy
     if is_within "$HOME_REAL" "$p"; then echo "contains your whole home directory"; return; fi
     if [[ $p == "$HOME_REAL"/.* ]]; then echo "hidden entry in \$HOME (credentials and configuration)"; return; fi
-    for d in /proc /sys /dev /run /var/run /boot "$SBX_ROOT" "$SBX_CONFIG_DIR" "${EXTRA_DENY[@]}"; do
+    for d in /proc /sys /dev /run /var/run /boot "$SBX_ROOT" "$SBX_CONFIG_DIR" "$SBX_DATA_DIR" "${EXTRA_DENY[@]}"; do
         d=$(realpath -m -- "$d")
         if is_within "$p" "$d"; then echo "inside protected path $d"; return; fi
         if is_within "$d" "$p"; then echo "contains protected path $d"; return; fi
@@ -295,7 +322,7 @@ check_shareable() {
 
 # A mount root is refused if it would make the policy meaningless: /, a
 # directory that contains your home, a hidden entry in it, or anything inside
-# this repository or the config directory. Missing roots are skipped.
+# this repository, the config or the data directory. Missing roots are skipped.
 in_mount_roots() {
     local root r roots=()
     load_policy
@@ -305,8 +332,9 @@ in_mount_roots() {
         [[ $root == /* ]] || die "mount root $root is not an absolute path"
         r=$(realpath -e -- "$root" 2>/dev/null) || continue
         if [ "$r" = / ] || is_within "$HOME_REAL" "$r" || [[ $r == "$HOME_REAL"/.* ]] \
-            || is_within "$r" "$SBX_ROOT" || is_within "$r" "$(realpath -m -- "$SBX_CONFIG_DIR")"; then
-            die "mount root $root is not allowed (/, your home or above, hidden entries, this repo, the config dir)"
+            || is_within "$r" "$SBX_ROOT" || is_within "$r" "$(realpath -m -- "$SBX_CONFIG_DIR")" \
+            || is_within "$r" "$(realpath -m -- "$SBX_DATA_DIR")"; then
+            die "mount root $root is not allowed (/, your home or above, hidden entries, this repo, the config or data dir)"
         fi
         if is_within "$1" "$r"; then return 0; fi
     done
@@ -502,7 +530,7 @@ scan_outputs() {
             hits+=("lab/out: COULD NOT remove (not a regular file): $rel")
         fi
     done
-    quarantine=$SBX_ROOT/state/quarantine/$(date +%Y%m%d-%H%M%S)
+    quarantine=$SBX_DATA_DIR/state/quarantine/$(date +%Y%m%d-%H%M%S)
     risky_entries "$LAB_OUT" || hits+=("lab/out: COULD NOT read everything to find risky entries; do not use it from the host")
     for f in "${RISKY[@]}"; do
         rel=${f#"$LAB_OUT"/}
@@ -511,7 +539,7 @@ scan_outputs() {
         elif mkdir -p -- "$(dirname -- "$quarantine/$rel")" \
                 && mv -T -- "$f" "$quarantine/$rel" 2>/dev/null \
                 && chmod 000 -- "$quarantine/$rel"; then
-            hits+=("lab/out: quarantined to ${quarantine#"$SBX_ROOT"/}: ${rel//$'\n'/\\n}")
+            hits+=("lab/out: quarantined to $(show "$quarantine"): ${rel//$'\n'/\\n}")
         else
             hits+=("lab/out: COULD NOT quarantine: ${rel//$'\n'/\\n}")
         fi
@@ -545,7 +573,7 @@ scan_outputs() {
         mkdir -p "$LOGS"
         f=$LOGS/changes-$(date +%Y%m%d-%H%M%S).txt
         printf '%s\n' "${changed[@]}" | sanitize > "$f"
-        hits+=("rw mounts: $n file(s) changed by the sandbox, ${#changed[@]} of them ordinary; list in ${f#"$SBX_ROOT"/}")
+        hits+=("rw mounts: $n file(s) changed by the sandbox, ${#changed[@]} of them ordinary; list in $(show "$f")")
     fi
     [ ${#hits[@]} -gt 0 ] || return 0
     note "WARNING: review before using these on the host (they can run code or redirect host tools):"
@@ -574,7 +602,7 @@ save_egress_log() {
     mkdir -p "$LOGS"
     f=$LOGS/egress-$(date +%Y%m%d-%H%M%S).log
     podman logs "$EGRESS" > "$f" 2>&1 || true
-    note "proxy log saved: ${f#"$SBX_ROOT"/}"
+    note "proxy log saved: $(show "$f")"
 }
 
 stop_all() {
@@ -789,6 +817,7 @@ cmd_status() {
     if in_vm_mode; then
         printf '%-11s %s running\n' microVMs "$(vm_runs | wc -l)"
     fi
+    printf '%-11s %s\n' data "$(show "$SBX_DATA_DIR")"
     if session_active && [ -f "$LAST_UP" ]; then
         echo "mounts (besides state/home, lab/in ro, lab/out rw):"
         mapfile -d '' -t last < "$LAST_UP"
@@ -900,7 +929,7 @@ cmd_token() {
 
 summarize_run() {
     local run=$1 rc=$2 f=$1/stream.jsonl result tools
-    printf 'run:      %s\n' "${run#"$SBX_ROOT"/}"
+    printf 'run:      %s\n' "$(show "$run")"
     # Anything in the sandbox can write lines to Claude's output, so every
     # filter tolerates JSON of an unexpected shape instead of aborting.
     result=$(jq -Rc 'fromjson? | objects | select(.type == "result")' "$f" | tail -n 1)
@@ -1051,7 +1080,7 @@ cmd_egress() {
         esac
         shift
     done
-    exists "$EGRESS" || die "proxy is not running (saved logs are in logs/)"
+    exists "$EGRESS" || die "proxy is not running (saved logs are in $(show "$LOGS"))"
     if [ "$all" = 1 ]; then
         podman logs "${follow[@]}" "$EGRESS" 2>&1 | sanitize
     else
@@ -1173,6 +1202,10 @@ main() {
     # Commands that share host paths load the policy here, in the main shell,
     # so a broken config stops them before any check runs.
     case $cmd in up|restart|check|in) load_policy ;; esac
+    case $cmd in
+        up|restart) check_old_layout strict ;;
+        down|status) check_old_layout note ;;
+    esac
     case $cmd in
         build)    cmd_build "$@" ;;
         up)       cmd_up "$@" ;;

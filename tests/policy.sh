@@ -9,8 +9,11 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/sbx-policy.XXXXXX")
 trap 'chmod -R u+rwX -- "$T" 2>/dev/null; rm -rf -- "$T"' EXIT
 R=$T/root
 mkdir -p "$R" "$T/outside" "$T/config"
-export SBX_MOUNT_ROOTS=$R SBX_CONFIG_DIR=$T/config
+# The data directory sits inside the mount root here, so that the test can
+# check that it is protected.
+export SBX_MOUNT_ROOTS=$R SBX_CONFIG_DIR=$T/config SBX_DATA_DIR=$R/sbx-data
 unset SBX_IMAGE
+mkdir -p "$SBX_DATA_DIR/lab/out"
 
 pass=0 fail=0
 
@@ -82,6 +85,10 @@ mkdir -p "$R/hardlink"
 echo x > "$R/hardlink/a"
 ln "$R/hardlink/a" "$R/hardlink/b"
 expect refused "$R/hardlink:ro" "hard-linked"
+
+# Runtime data (agent home, lab/out, transcripts) is never shared again.
+expect refused "$SBX_DATA_DIR:ro" "protected path"
+expect refused "$SBX_DATA_DIR/lab/out:rw" "protected path"
 
 # Fail closed: a directory the scan cannot read could hide a hard link or a
 # .git, so the whole mount is refused (ro and rw), never silently accepted.

@@ -1,4 +1,4 @@
-# Runtime data of the sandbox — never commit
+# Runtime data of older versions (now in ~/.local/state/agent-sandbox) — never commit
 /state/
 /lab/
 /runs/

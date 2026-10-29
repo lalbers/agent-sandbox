@@ -76,7 +76,7 @@ host (rootless Podman, SELinux enforcing)
 | Agent | `bypassPermissions` is on, so Claude does not ask before a tool call. Only the image's MCP configuration and hooks are loaded. `api` mode turns WebFetch and WebSearch off. Each session resets the agent home to the image and keeps transcripts, so a hook, `CLAUDE.md`, a skill or a poisoned npm cache cannot carry into the next session. |
 | Network | No route and no DNS in the sandbox. Traffic goes through squid. `api` is the default and allows only `api.anthropic.com`. The allowlist is `dstdomain -n` and it runs before any rule that resolves a name. An earlier config evaluated squid's `dst` ACL first, and that lookup let `secret.attacker.example` reach the attacker's nameserver in `api` mode. `sbx selftest` compares the proxy's UDP counters around requests for random names. `open` allows public destinations on ports 80 and 443. Both modes refuse private, loopback, link-local (cloud metadata), multicast and NAT64. `none` has no network: Claude cannot run, `sbx sh` still works. |
 | Mounts | Read-only by default, only below `mount-roots`. Paths outside the roots can only be copied in. On a writable mount, existing risky entries are bind-mounted read-only, and those paths cannot themselves be mounted writable: `.git` and other git directories, `.gitmodules`, `.gitattributes`, Mercurial and Jujutsu directories, `.claude`, `CLAUDE.md`, `CLAUDE.local.md`, other coding agents' instructions (`AGENTS.md`, `GEMINI.md`, `.gemini`, `.cursor`, `.cursorrules`), `.mcp.json`, `.envrc`, editor, pre-commit, package-manager and toolchain configuration. Hooks already in a mounted repo stay read-only. A new file beside them is created on the host. |
-| Outputs | `sbx down` stops the sandbox, then scans. In `lab/out` it deletes symlinks and special files and moves risky entries to `state/quarantine` with all permissions removed. On a writable mount it lists every file the sandbox changed and flags risky names and new git repositories. The scan uses ctime. Podman's `:z`/`:Z` relabel bumps ctime, so the stamp is written after the relabel; microVM runs share a fixed MCS level and do not relabel again. `sbx ask`, `cat`, `screen`, `egress` and `selftest` strip control characters and bidi controls before printing. `sbx sh` does not. `tui` and `attach` are a live terminal and are not filtered. |
+| Outputs | `sbx down` stops the sandbox, then scans. In `lab/out` it deletes symlinks and special files and moves risky entries to `state/quarantine` in the data directory, with all permissions removed. On a writable mount it lists every file the sandbox changed and flags risky names and new git repositories. The scan uses ctime. Podman's `:z`/`:Z` relabel bumps ctime, so the stamp is written after the relabel; microVM runs share a fixed MCS level and do not relabel again. `sbx ask`, `cat`, `screen`, `egress` and `selftest` strip control characters and bidi controls before printing. `sbx sh` does not. `tui` and `attach` are a live terminal and are not filtered. |
 
 ## Limits
 
@@ -121,7 +121,7 @@ host (rootless Podman, SELinux enforcing)
 | `sbx up [--net api\|open\|none] [--vm] [--mount PATH[:ro\|:rw]]... [--copy PATH]...` | Start the proxy and the sandbox. `--net` defaults to `api`. Mounts stay fixed for the session. `sbx up --replace` changes them. |
 | `sbx restart` | Recreate with the last `--net`, `--vm` and `--mount` options, for example after `sbx token set`. |
 | `sbx in PATH...` / `sbx check PATH[:ro\|:rw]...` | `in` copies more inputs into `/lab/in`. `check` dry-runs the mount policy. |
-| `sbx ask [--resume ID\|--continue] PROMPT` | Headless `claude -p`. Prints the session ID, the tools used and the result. The transcript goes to `runs/`. Resume only into the same `--net`, `--vm` and mounts, or a tighter set: a transcript can carry planted turns. |
+| `sbx ask [--resume ID\|--continue] PROMPT` | Headless `claude -p`. Prints the session ID, the tools used and the result. The transcript goes to `runs/` in the data directory. Resume only into the same `--net`, `--vm` and mounts, or a tighter set: a transcript can carry planted turns. |
 | `sbx cat FILE` | Print a result. The read happens inside the sandbox, so a planted symlink cannot point it at a host file. |
 | `sbx tui` / `attach` / `screen` / `keys` | Interactive Claude in tmux. `screen` and `keys` let a host session read and type. `attach`, `screen` and `keys` need container mode. In vm mode `tui` runs in your terminal. |
 | `sbx sh [-- CMD]` | Shell or one command inside, for example `sbx sh -- rea doctor --json`. Output is not filtered. |
@@ -155,6 +155,11 @@ privileges: no `SYS_PTRACE`, no relaxed seccomp. They do execute the target. `sb
 
 Personal settings are outside the repo, in `~/.config/agent-sandbox/`
 (see `config/*.example`). An entry is an absolute path or starts with `~/`.
+Runtime data is outside the repo too, in `~/.local/state/agent-sandbox/`
+(`SBX_DATA_DIR`): the agent home, `lab/in`, `lab/out`, transcripts in `runs/`,
+logs and the quarantine. Nothing the sandbox writes lands in a directory where
+git or a Claude Code session works on this repository, and the directory itself
+can never be mounted.
 
 - `mount-roots`: directories a mount has to sit under. Default
   `~/Downloads`. `/`, your home or anything above it, a hidden entry in your
@@ -166,8 +171,9 @@ Node.js or Ghidra requirement, edit the file, then `sbx build` and
 `sbx restart`. Node.js is not a Fedora package in this image, so a Node
 security release means a pin bump.
 
-`SBX_IMAGE`, `SBX_MOUNT_ROOTS` and `SBX_CONFIG_DIR` change what runs or what
-may be shared, and `sbx` prints them when they apply. `SBX_MEMORY` and
+`SBX_IMAGE`, `SBX_MOUNT_ROOTS`, `SBX_CONFIG_DIR` and `SBX_DATA_DIR` change what
+runs, what may be shared or where results land, and `sbx` prints them when they
+apply. `SBX_MEMORY` and
 `SBX_CPUS` override the container-row limits.
 
 From a Claude Code session on the host, every `sbx` call has to run outside
