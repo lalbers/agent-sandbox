@@ -92,6 +92,10 @@ expect ok "$R/agents:rw" "mount ro $R/agents/.hg (stays read-only)"
 expect ok "$R/agents:rw" "mount ro $R/agents/.gitmodules (stays read-only)"
 expect refused "$R/agents/.gemini:rw" "tool configuration"
 
+# Names with control characters never reach the terminal or a mount.
+mkdir -p "$R/ctl/x"$'\e'"]0;pwned"$'\a'"/.git"
+expect refused "$R/ctl:rw" "unsupported character"
+
 # Relabelling a hard-linked file would relabel its other links too.
 mkdir -p "$R/hardlink"
 echo x > "$R/hardlink/a"

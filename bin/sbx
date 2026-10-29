@@ -310,7 +310,9 @@ resolve_path() {
     p=$(realpath -e -- "$1" 2>/dev/null && printf x) || die "path does not exist: $1"
     p=${p%x}
     p=${p%$'\n'}
-    case $p in *[:,]*|*$'\n'*) die "paths containing ':', ',' or a newline are not supported: $p" ;; esac
+    case $p in
+        *[:,]*|*[[:cntrl:]]*) die "paths containing ':', ',' or control characters are not supported: $(printf '%s' "$p" | sanitize)" ;;
+    esac
     printf '%s\n' "$p"
 }
 
@@ -445,8 +447,9 @@ add_mount() {
         # or config that run on the host. New ones are reported by scan_outputs.
         risky_entries "$p" || die "refusing $p: cannot read all of it to find git metadata and tool configuration"
         for g in "${RISKY[@]}"; do
+            # The sandbox may have chosen this name in an earlier session.
+            case $g in *[:,]*|*[[:cntrl:]]*) die "refusing $p: unsupported character in $(printf '%s' "$g" | sanitize)" ;; esac
             [ ! -L "$g" ] || die "refusing $p: $g is a symlink"
-            case $g in *[:,]*|*$'\n'*) die "refusing $p: unsupported character in $g" ;; esac
             MOUNT_ARGS+=(-v "$g:/host$g:ro,Z,bind")
             note "mount ro $g (stays read-only)"
         done
