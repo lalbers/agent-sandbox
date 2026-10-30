@@ -176,6 +176,13 @@ The sandbox cannot change a hook that is already in a mounted repo, because
 that path stays read-only, but a new file it creates next to a hook on an
 rw mount lands on the host.
 
+In vm mode every microVM run resolves its mounts again, by path. Inside an
+rw mount, one run could rename a directory and leave something else at
+that path for the next. So `sbx up --vm` refuses a mount inside an rw
+mount, and risky entries below the top level of an rw mount. Mount the
+directory that holds them rw instead of the outer one, mount read-only, or
+use container mode.
+
 ### Outputs
 
 `sbx down` stops the sandbox, then scans.
@@ -342,7 +349,9 @@ the limits described under Container.
 - `tests/scan.sh` runs `sbx up` and `sbx down` with a stand-in for
   `podman` and checks that `sbx down` flags risky entries an agent can add
   to an rw mount: created, renamed or moved there. It needs `jq`,
-  util-linux and Podman's default seccomp profile, not Podman itself.
+  util-linux and Podman's default seccomp profile, not Podman itself. Its
+  vm mode checks, which mounts `sbx up --vm` refuses or accepts, run only
+  where libkrun and `/dev/kvm` are available.
 - `tests/guard.sh` runs probes under `sbx-guard` and compares the kernel's
   answers with and without the seccomp filter.
 - `sbx selftest` checks a running sandbox from inside and from the host:

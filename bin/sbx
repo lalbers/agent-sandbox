@@ -505,6 +505,36 @@ add_mount() {
     fi
 }
 
+# check_vm_mounts: every microVM run resolves its mounts again, by path. An
+# earlier or concurrent run can rename any directory of an rw mount that is
+# not itself a mount point, and leave something else (a symlink to anywhere)
+# at that path for the next run. So in vm mode no mount may lie inside an rw
+# mount, and read-only overlays are only allowed at its top level: the mount
+# root and a top-level overlay are mount points in every run, so their paths
+# cannot change.
+check_vm_mounts() {
+    local rec g spec p r ok roots=()
+    for spec in "${MOUNT_SPECS[@]}"; do
+        case $spec in *:rw) roots+=("${spec%:rw}") ;; esac
+    done
+    for spec in "${MOUNT_SPECS[@]}"; do
+        p=${spec%:*}
+        for r in "${roots[@]}"; do
+            if [ "$p" != "$r" ] && is_within "$p" "$r"; then
+                die "refusing --vm: $p is inside the rw mount $r, where a microVM run could redirect it for the next; mount only one of them, or drop --vm"
+            fi
+        done
+    done
+    for rec in "${MOUNT_RISKY[@]}"; do
+        g=${rec#* }
+        ok=0
+        for r in "${roots[@]}"; do
+            if [ "${g%/*}" = "$r" ]; then ok=1; break; fi
+        done
+        [ "$ok" = 1 ] || die "refusing --vm: $g is below the top level of an rw mount, where a microVM run cannot keep it read-only; mount ${g%/*} rw instead, mount read-only, or drop --vm"
+    done
+}
+
 # session_rw_mounts: the rw mount sources of the current session (from `sbx up`).
 session_rw_mounts() {
     local spec last=()
@@ -781,6 +811,7 @@ cmd_up() {
     # Validate mounts only now, so a running sandbox cannot swap a path
     # between the check and the mount.
     for spec in "${specs[@]}"; do add_mount "$spec"; done
+    if [ "$vm" = 1 ]; then check_vm_mounts; fi
 
     mkdir -p "$STATE_HOME" "$LAB_IN" "$LAB_OUT" "$RUNS" "$LOGS"
     # What stays read-only, recorded before the sandbox starts: scan_outputs

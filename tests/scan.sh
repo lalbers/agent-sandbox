@@ -46,6 +46,12 @@ run() {
     fi
 }
 
+# try CMD...: run sbx, keep its output in $out, followed by "(accepted)" if
+# it succeeded.
+try() {
+    if out=$("$SBX" "$@" 2>&1); then out+=$'\n(accepted)'; fi
+}
+
 # has yes|no LINE: the last sbx output has LINE as a whole line, or does not.
 has() {
     local want=$1 line=$2 got=no
@@ -98,6 +104,28 @@ rm -f -- "$SBX_DATA_DIR/state/up-risky"
 run down
 has yes "  rw mount: no record from sbx up of what stayed read-only in $P; every risky entry is listed"
 has yes "$NEW $P/.git"
+
+# vm mode: every microVM run resolves its mounts again by path, so no mount
+# may lie inside an rw mount, and read-only overlays only at its top level.
+# `sbx up --vm` needs libkrun and /dev/kvm before it gets that far.
+if [ -x /usr/bin/krun ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    V=$R/vm
+    mkdir -p "$V/top/.git" "$V/top/lib/.git" "$V/flat/.git" "$V/flat/a/b"
+    touch "$V/flat/CLAUDE.md"
+    try up --net none --vm --mount "$V/top:rw"
+    has yes "sbx: refusing --vm: $V/top/lib/.git is below the top level of an rw mount, where a microVM run cannot keep it read-only; mount $V/top/lib rw instead, mount read-only, or drop --vm"
+    has no "(accepted)"
+    try up --net none --vm --mount "$V/flat:rw" --mount "$V/flat/a/b:ro"
+    has yes "sbx: refusing --vm: $V/flat/a/b is inside the rw mount $V/flat, where a microVM run could redirect it for the next; mount only one of them, or drop --vm"
+    has no "(accepted)"
+    run up --net none --vm --mount "$V/flat:rw"
+    touch "$V/flat/.envrc"
+    run down
+    has yes "$NEW $V/flat/.envrc"
+    has no "$NEW $V/flat/.git"
+else
+    echo "skipped vm mode checks: no libkrun or /dev/kvm"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
