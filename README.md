@@ -357,14 +357,6 @@ the limits described under Container.
   without warranty (see the license). Report vulnerabilities as described
   in [SECURITY.md](SECURITY.md).
 
-## How this was built
-
-The first three commits come from the private repository the project
-started in, with personal paths redacted. The rest is the rework and
-hardening for publication. Every commit in this repository names Claude as
-co-author in a `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
-trailer.
-
 ## License
 
 MIT, see [LICENSE](LICENSE). The images install third-party software at
