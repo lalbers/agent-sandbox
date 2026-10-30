@@ -2,41 +2,58 @@
 
 ## Reporting a vulnerability
 
-Report it privately through GitHub: the repository's **Security** tab, then
-**Report a vulnerability**. Please do not open a public issue. Include the
-commit you tested, your setup (distribution, Podman and libkrun versions,
-`--net` and `--vm` options) and the steps to reproduce. Do not include real
-tokens or samples you may not share.
+Report a vulnerability privately through GitHub: the repository's **Security**
+tab, then **Report a vulnerability**. Please do not open a public issue.
+Include the commit you tested, your setup (distribution, Podman and libkrun
+versions, `--net`, and `--vm`), and the steps to reproduce. Do not include
+real tokens or samples you may not share.
 
-This is a single-maintainer project. Expect a first answer within a week; fixes
-land on `main`, which is the only supported version.
+This is a single-maintainer project. Expect a first answer within a week.
+Fixes land on `main`, the only supported version.
 
 ## In scope
 
-The threat model is the one in the README: the analysed sample compromises the
-agent and REA. A report is in scope if, from that position, it can:
+The README threat model applies: the analysed sample compromises the agent
+and REA. A report is in scope if the sample can:
 
-- reach a host path that was neither mounted nor copied, or write to a path
-  mounted read-only;
+- reach a host path neither mounted nor copied, or write to a read-only
+  mount;
 - get `sbx check` or `sbx up` to accept a mount the policy should refuse;
-- reach the LAN, the host, cloud metadata or, in `api` mode, any host other
-  than `api.anthropic.com`, or leak data through DNS;
-- leave a symlink, a risky entry or a change in `lab/out` or an rw mount that
-  `sbx down` does not report or defuse;
-- run code on the host through what `sbx` prints or what the host tools it
-  names act on;
-- escape a microVM, or get a microVM to run or write after `sbx down` scanned.
+- reach the LAN, the host, or cloud metadata; in `api` mode, reach any
+  host other than `api.anthropic.com`; leak data through DNS; or get the
+  egress proxy to allow a destination it should refuse;
+- leave, in `lab/out`, a symlink or special file `sbx down` did not
+  delete, or a risky entry it did not quarantine;
+- leave, on an rw mount, a changed file `sbx down` did not list, or a
+  risky name, symlink, or new git repository it did not flag;
+- run code on the host through what `sbx` prints, or when a host tool
+  that `sbx` names acts on files left in `lab/out` or on an rw mount
+  (git hooks, `core.fsmonitor`, `.envrc` via direnv, or Claude Code
+  project settings);
+- get past the VMM's container confinement, or get a microVM to run or
+  write after `sbx down` scanned `lab/out` and rw mounts.
 
 ## Out of scope
 
-These are listed as limits in the README:
+README limits are out of scope.
 
-- kernel exploits in container mode;
-- data leaving through `api.anthropic.com`, including the API's server-side
-  tools reached with the token;
-- the build-time supply chain (unpinned Fedora packages, npm and pip
-  resolution at build time);
-- vulnerabilities in Claude Code, REA, Ghidra, Podman, crun, libkrun or squid
-  themselves (please report those upstream), unless `sbx` uses them unsafely;
-- setups that deliberately weaken the defaults, such as mount roots that
-  contain sensitive data or `--net open` with live malware.
+- Kernel exploits in container mode.
+- Data can leave through `api.anthropic.com`, including the API's
+  server-side tools reached with the token.
+- The build-time supply chain (unpinned Fedora packages, npm and pip
+  resolution at build time).
+- Hostile file contents in `lab/out` are not a finding by themselves.
+  There, `sbx down` only deletes symlinks and special files, and
+  quarantines risky entries.
+- Deletions and directory-only changes on an rw mount are unreported by
+  design.
+- Guest root can reach the VMM inside container confinement.
+- A compromised egress proxy can reach the LAN from its normal network
+  namespace.
+
+Vulnerabilities in Claude Code, REA, Ghidra, Podman, crun, libkrun, or squid
+themselves (please report those upstream) are out of scope, unless `sbx`
+uses them unsafely.
+
+Setups such as mount roots that contain sensitive data, or `--net open`
+with live malware, deliberately weaken the defaults and are out of scope.
