@@ -172,6 +172,13 @@ instructions (`AGENTS.md`, `GEMINI.md`, `.cursor` and more), `.mcp.json`,
 `.envrc`, and editor, git-hook-manager, package-manager and toolchain
 configuration. The full list is `RISKY_NAMES` in `bin/sbx`.
 
+A path that contains another filesystem cannot be mounted: neither a
+mount point nor a directory on another filesystem, such as a btrfs
+subvolume. The checks and the scan do not look inside those. Mount it on
+its own, or copy it in. The sandbox can snapshot a btrfs subvolume that is
+mounted on its own, even read-only, into a writable copy on an rw mount
+or in `/lab/out`.
+
 The sandbox cannot change a hook that is already in a mounted repo, because
 that path stays read-only, but a new file it creates next to a hook on an
 rw mount lands on the host.
@@ -200,6 +207,13 @@ and directory-only changes that add no risky entry, are not reported.
 `sbx` relabels mounts with `:Z` only, which bumps ctime, so the scan stamp
 is written after that relabel. Every microVM run reuses the MCS level
 `s0:c701,c702`, distinct from other containers, and does not relabel again.
+
+A directory on another filesystem, such as a btrfs subvolume or snapshot
+the sandbox made, is not checked inside. In `/lab/out` it goes to the
+quarantine as a whole (a read-only snapshot is made writable first, which
+needs the `btrfs` command); while one is left there, `sbx up` refuses to
+start. On an rw mount it is flagged, and the next `sbx up` refuses that
+mount until it is gone.
 
 `sbx ask`, `cat`, `screen`, `egress` and `selftest` strip control
 characters and bidi controls before printing. `perl` (with Encode) is
@@ -352,6 +366,8 @@ the limits described under Container.
   util-linux and Podman's default seccomp profile, not Podman itself. Its
   vm mode checks, which mounts `sbx up --vm` refuses or accepts, run only
   where libkrun and `/dev/kvm` are available.
+- With `TMPDIR` on btrfs and the `btrfs` command installed, both test
+  scripts also check subvolumes.
 - `tests/guard.sh` runs probes under `sbx-guard` and compares the kernel's
   answers with and without the seccomp filter.
 - `sbx selftest` checks a running sandbox from inside and from the host:

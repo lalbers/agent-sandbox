@@ -379,9 +379,31 @@ in_mount_roots() {
     return 1
 }
 
+# other_fs DIR: set OTHER_FS to the directories below DIR on another
+# filesystem: mount points, and btrfs subvolumes, which are not. find -xdev,
+# which every check here relies on, lists them but does not look inside.
+# Fails if DIR cannot be read completely.
+other_fs() {
+    local dev devs t rc=0 list=()
+    OTHER_FS=()
+    dev=$(stat -c %d -- "$1") || return 1
+    # Usually every directory is on DIR's filesystem; that is quick to confirm.
+    if devs=$(find "$1" -xdev -mindepth 1 -type d -printf '%D\n' 2>/dev/null | sort -u) \
+        && { [ -z "$devs" ] || [ "$devs" = "$dev" ]; }; then
+        return 0
+    fi
+    find0 list "$1" -xdev -mindepth 1 -type d -printf '%D %p\0' || rc=1
+    for t in "${list[@]}"; do
+        if [ "${t%% *}" != "$dev" ]; then OTHER_FS+=("${t#* }"); fi
+    done
+    return "$rc"
+}
+
 # Bind mounts are relabelled (:z). Refuse what relabelling would damage or
 # cannot handle: network/FUSE filesystems, nested mount points, hard links
-# (the label would change for the other link, e.g. a key file, too).
+# (the label would change for the other link, e.g. a key file, too), and
+# nested filesystems such as btrfs subvolumes, which the checks here and in
+# scan_outputs do not look into, but relabelling and the sandbox do.
 check_relabel_safe() {
     local p=$1 fstype mounts t hits=()
     fstype=$(stat -f -c %T -- "$p")
@@ -393,9 +415,12 @@ check_relabel_safe() {
         t=$(printf '%b' "$t")
         if [ "$t" != "$p" ] && is_within "$t" "$p"; then die "refusing $p: contains mount point $t; use --copy"; fi
     done <<< "$mounts"
+    other_fs "$p" || die "refusing $p: cannot read all of it to check for nested filesystems; use --copy"
+    [ ${#OTHER_FS[@]} -eq 0 ] \
+        || die "refusing $p: $(printf '%s' "${OTHER_FS[0]//$'\n'/\\n}" | sanitize) is another filesystem (a btrfs subvolume?) that sbx does not check inside; mount it on its own, or use --copy"
     find0 hits "$p" -xdev -type f -links +1 -print0 -quit \
         || die "refusing $p: cannot read all of it to check for hard links; use --copy"
-    [ ${#hits[@]} -eq 0 ] || die "refusing $p: hard-linked file ${hits[0]} would be relabelled for all its links; use --copy"
+    [ ${#hits[@]} -eq 0 ] || die "refusing $p: hard-linked file $(printf '%s' "${hits[0]//$'\n'/\\n}" | sanitize) would be relabelled for all its links; use --copy"
 }
 
 # Names that make host tools run or load something when you work in that
@@ -582,6 +607,17 @@ is_risky_path() {
     return 1
 }
 
+# quarantine_to SRC DEST: move SRC to DEST and remove all permissions. A
+# read-only btrfs snapshot (a subvolume root, inode 256) can be neither moved,
+# since its ".." would change, nor chmodded until its owner makes it writable.
+quarantine_to() {
+    if [ "$(stat -c %i -- "$1")" = 256 ] && [ "$(stat -f -c %T -- "$1")" = btrfs ] \
+        && command -v btrfs >/dev/null; then
+        btrfs property set -f -ts "$1" ro false >/dev/null 2>&1 || true
+    fi
+    mkdir -p -- "${2%/*}" && mv -T -- "$1" "$2" 2>/dev/null && chmod 000 -- "$2"
+}
+
 # scan_outputs report|defuse — find what the sandbox left behind that could act
 # on the host.
 #   lab/out: symlinks and special files (host tools would follow them to host
@@ -607,7 +643,8 @@ scan_outputs() {
     fi
     # What cannot be read cannot be checked: say so instead of passing it.
     # Without lab/out no session has written anything there yet.
-    if [ -d "$LAB_OUT" ] && ! find0 list "$LAB_OUT" -mindepth 1 ! -type f ! -type d -print0; then
+    # Not inside another filesystem: that goes to the quarantine as a whole.
+    if [ -d "$LAB_OUT" ] && ! find0 list "$LAB_OUT" -xdev -mindepth 1 ! -type f ! -type d -print0; then
         hits+=("lab/out: COULD NOT read everything; do not use it from the host")
     fi
     for f in "${list[@]}"; do
@@ -630,12 +667,27 @@ scan_outputs() {
         rel=${f#"$LAB_OUT"/}
         if [ "$mode" = report ]; then
             hits+=("lab/out: ${rel//$'\n'/\\n} (quarantined at sbx down)")
-        elif mkdir -p -- "$(dirname -- "$quarantine/$rel")" \
-                && mv -T -- "$f" "$quarantine/$rel" 2>/dev/null \
-                && chmod 000 -- "$quarantine/$rel"; then
+        elif quarantine_to "$f" "$quarantine/$rel"; then
             hits+=("lab/out: quarantined to $(show "$quarantine"): ${rel//$'\n'/\\n}")
         else
             hits+=("lab/out: COULD NOT quarantine: ${rel//$'\n'/\\n}")
+        fi
+    done
+    # The checks above do not look into another filesystem, such as a btrfs
+    # subvolume or a snapshot of a mounted one the sandbox made: it goes to
+    # the quarantine as a whole.
+    OTHER_FS=()
+    if [ -d "$LAB_OUT" ] && ! other_fs "$LAB_OUT"; then
+        hits+=("lab/out: COULD NOT read everything to find nested filesystems; do not use it from the host")
+    fi
+    for f in "${OTHER_FS[@]}"; do
+        rel=${f#"$LAB_OUT"/}
+        if [ "$mode" = report ]; then
+            hits+=("lab/out: ${rel//$'\n'/\\n} (another filesystem, btrfs subvolume?; quarantined at sbx down)")
+        elif quarantine_to "$f" "$quarantine/$rel"; then
+            hits+=("lab/out: quarantined to $(show "$quarantine") (another filesystem, btrfs subvolume?): ${rel//$'\n'/\\n}")
+        else
+            hits+=("lab/out: COULD NOT quarantine (another filesystem, btrfs subvolume?): ${rel//$'\n'/\\n}")
         fi
     done
     # rw mounts of the current session, as recorded by `sbx up`.
@@ -660,6 +712,11 @@ scan_outputs() {
             done
             risky_entries "$src" \
                 || hits+=("rw mount: COULD NOT read everything in ${src//$'\n'/\\n} to find new risky entries")
+            other_fs "$src" \
+                || hits+=("rw mount: COULD NOT read everything in ${src//$'\n'/\\n} to find nested filesystems")
+            for f in "${OTHER_FS[@]}"; do
+                hits+=("rw mount: RISKY another filesystem (btrfs subvolume?), not checked inside: ${f//$'\n'/\\n}")
+            done
             if [ "$recorded" = 0 ]; then
                 hits+=("rw mount: no record from sbx up of what stayed read-only in ${src//$'\n'/\\n}; every risky entry is listed")
             fi
@@ -814,6 +871,11 @@ cmd_up() {
     if [ "$vm" = 1 ]; then check_vm_mounts; fi
 
     mkdir -p "$STATE_HOME" "$LAB_IN" "$LAB_OUT" "$RUNS" "$LOGS"
+    # Relabelling would make a subvolume left in lab/out (one sbx down could
+    # not quarantine) writable to the sandbox, with nothing checked inside.
+    other_fs "$LAB_OUT" || die "cannot read all of $(show "$LAB_OUT") to check for nested filesystems"
+    [ ${#OTHER_FS[@]} -eq 0 ] \
+        || die "$(printf '%s' "${OTHER_FS[0]//$'\n'/\\n}" | sanitize) is another filesystem (a btrfs subvolume?) in lab/out that sbx down could not quarantine; move $(show "$LAB_OUT") aside (deleting a read-only snapshot may need root: btrfs subvolume delete)"
     # What stays read-only, recorded before the sandbox starts: scan_outputs
     # flags every other risky entry in the rw mounts.
     if [ ${#MOUNT_RISKY[@]} -gt 0 ]; then printf '%s\0' "${MOUNT_RISKY[@]}"; fi > "$UP_RISKY"

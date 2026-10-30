@@ -46,6 +46,24 @@ run() {
     fi
 }
 
+# mentions TEXT: the last sbx output contains TEXT anywhere.
+mentions() {
+    if [[ $out == *"$1"* ]]; then
+        printf 'ok    mentions %s\n' "$1"; pass=$((pass + 1))
+    else
+        printf 'FAIL  mentions %s\n%s\n' "$1" "$out" | sed 's/^/      /;1s/^      //'; fail=$((fail + 1))
+    fi
+}
+
+# absent PATH: PATH no longer exists.
+absent() {
+    if [ ! -e "$1" ]; then
+        printf 'ok    absent %s\n' "$1"; pass=$((pass + 1))
+    else
+        printf 'FAIL  absent %s\n' "$1"; fail=$((fail + 1))
+    fi
+}
+
 # try CMD...: run sbx, keep its output in $out, followed by "(accepted)" if
 # it succeeded.
 try() {
@@ -125,6 +143,35 @@ if [ -x /usr/bin/krun ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     has no "$NEW $V/flat/.git"
 else
     echo "skipped vm mode checks: no libkrun or /dev/kvm"
+fi
+
+# A btrfs subvolume (or a snapshot) the agent makes is another filesystem,
+# which the scan does not look into: flagged on an rw mount, quarantined in
+# lab/out, and sbx up refuses to start while one is left there. Only where
+# TMPDIR is on btrfs.
+if [ "$(stat -f -c %T -- "$T")" = btrfs ] && command -v btrfs >/dev/null; then
+    B=$R/sv
+    mkdir -p "$B"
+    run up --net none --mount "$B:rw"
+    btrfs -q subvolume create "$R/src"
+    mkdir -p "$R/src/repo/.git/hooks"
+    btrfs -q subvolume create "$B/inner"
+    btrfs -q subvolume create "$SBX_DATA_DIR/lab/out/inner"
+    mkdir -p "$SBX_DATA_DIR/lab/out/inner/repo/.git"
+    btrfs -q subvolume snapshot -r "$R/src" "$SBX_DATA_DIR/lab/out/rosnap"
+    run down
+    has yes "  rw mount: RISKY another filesystem (btrfs subvolume?), not checked inside: $B/inner"
+    mentions "(another filesystem, btrfs subvolume?): inner"
+    absent "$SBX_DATA_DIR/lab/out/inner"
+    mentions "(another filesystem, btrfs subvolume?): rosnap"
+    absent "$SBX_DATA_DIR/lab/out/rosnap"
+    btrfs -q subvolume create "$SBX_DATA_DIR/lab/out/stray"
+    try up --net none
+    mentions "lab/out/stray is another filesystem (a btrfs subvolume?) in lab/out"
+    has no "(accepted)"
+    rmdir "$SBX_DATA_DIR/lab/out/stray"
+else
+    echo "skipped btrfs subvolume checks: TMPDIR is not on btrfs"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

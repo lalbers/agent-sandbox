@@ -136,5 +136,19 @@ expect refused "$R/locked:ro" "cannot read"
 expect refused "$R/locked:rw" "cannot read"
 chmod 700 "$R/locked/inner"
 
+# A btrfs subvolume is another filesystem without being a mount point; the
+# checks do not look inside it, so a mount that contains one is refused.
+# Only where TMPDIR is on btrfs (a regular user can create subvolumes).
+if [ "$(stat -f -c %T -- "$T")" = btrfs ] && command -v btrfs >/dev/null; then
+    mkdir -p "$R/sv"
+    btrfs -q subvolume create "$R/sv/inner"
+    mkdir -p "$R/sv/inner/repo/.git"
+    expect refused "$R/sv:ro" "another filesystem"
+    expect refused "$R/sv:rw" "another filesystem"
+    expect ok "$R/sv/inner:rw" "mount ro $R/sv/inner/repo/.git (stays read-only)"
+else
+    echo "skipped btrfs subvolume checks: TMPDIR is not on btrfs"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
