@@ -185,8 +185,11 @@ risky entry to `state/quarantine` in the data directory, with all
 permissions removed, regardless of ctime.
 
 On an rw mount it lists every file (not directory) whose ctime is newer
-than the start of the sandbox, and flags risky names and new git
-repositories. Deletions and directory-only changes are not reported.
+than the start of the sandbox, and flags symlinks and risky names among
+them. It also flags every risky entry that `sbx up` did not mount
+read-only, compared by path and inode, so a directory renamed or moved to
+a risky name is caught although its files keep their ctime. Deletions,
+and directory-only changes that add no risky entry, are not reported.
 `sbx` relabels mounts with `:Z` only, which bumps ctime, so the scan stamp
 is written after that relabel. Every microVM run reuses the MCS level
 `s0:c701,c702`, distinct from other containers, and does not relabel again.
@@ -336,12 +339,16 @@ the limits described under Container.
   scratch directory: symlinks, git directories (bare, symlinked `HEAD`,
   linked worktrees), risky names, unreadable directories, hard links,
   control characters and the data directory. No Podman is needed.
+- `tests/scan.sh` runs `sbx up` and `sbx down` with a stand-in for
+  `podman` and checks that `sbx down` flags risky entries an agent can add
+  to an rw mount: created, renamed or moved there. It needs `jq`,
+  util-linux and Podman's default seccomp profile, not Podman itself.
 - `tests/guard.sh` runs probes under `sbx-guard` and compares the kernel's
   answers with and without the seccomp filter.
 - `sbx selftest` checks a running sandbox from inside and from the host:
   confinement, network refusals, the DNS-leak counter, mounts and, in vm
   mode, the VMM process.
-- CI runs ShellCheck, both test scripts, hadolint and a squid parse of
+- CI runs ShellCheck, the three test scripts, hadolint and a squid parse of
   both egress configurations on pushes to main and on pull requests.
 
 ## Responsible use

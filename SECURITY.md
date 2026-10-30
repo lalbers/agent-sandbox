@@ -45,8 +45,8 @@ README limits are out of scope.
 - Hostile file contents in `lab/out` are not a finding by themselves.
   There, `sbx down` only deletes symlinks and special files, and
   quarantines risky entries.
-- Deletions and directory-only changes on an rw mount are unreported by
-  design.
+- Deletions on an rw mount, and directory-only changes there that add no
+  risky entry, are unreported by design.
 - Guest root can reach the VMM inside container confinement.
 - A compromised egress proxy can reach the LAN from its normal network
   namespace.

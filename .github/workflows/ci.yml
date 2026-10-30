@@ -20,7 +20,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/mnt:ro" -w /mnt \
             docker.io/koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d \
-            bin/sbx tests/policy.sh tests/guard.sh container/sbx-entrypoint container/sbx-claude \
+            bin/sbx tests/policy.sh tests/scan.sh tests/guard.sh container/sbx-entrypoint container/sbx-claude \
             container/sbx-selftest egress/egress-entrypoint host/install-krun.sh
       - name: JSON and Python syntax
         run: |
@@ -28,6 +28,11 @@ jobs:
           python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' container/sbx-guard
       - name: Mount-policy tests
         run: tests/policy.sh
+      - name: Output-scan tests
+        # Without Podman's seccomp profile the script skips; here that fails.
+        run: |
+          test -r /usr/share/containers/seccomp.json
+          tests/scan.sh
       - name: sbx-guard seccomp tests
         run: tests/guard.sh
 

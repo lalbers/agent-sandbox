@@ -42,6 +42,7 @@ SBX_DATA_DIR=${SBX_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-sandbox
 STATE_HOME=$SBX_DATA_DIR/state/home
 LAST_UP=$SBX_DATA_DIR/state/last-up
 UP_STAMP=$SBX_DATA_DIR/state/up-stamp
+UP_RISKY=$SBX_DATA_DIR/state/up-risky      # "inode path" of each risky entry mounted read-only
 MODE_FILE=$SBX_DATA_DIR/state/mode         # "container|vm NET" while a session is up
 VM_ARGS=$SBX_DATA_DIR/state/vm-args        # podman run args + image for microVM runs
 STOPPING=$SBX_DATA_DIR/state/stopping      # set while `sbx down` runs: no new microVMs
@@ -468,7 +469,7 @@ risky_entries() {
 
 # add_mount PATH[:ro|:rw] — validate a bind mount and append it to MOUNT_ARGS.
 add_mount() {
-    local spec=$1 raw mode p dst g
+    local spec=$1 raw mode p dst g id
     case $spec in
         *:rw) raw=${spec%:rw}; mode=rw ;;
         *:ro) raw=${spec%:ro}; mode=ro ;;
@@ -496,7 +497,9 @@ add_mount() {
             # The sandbox may have chosen this name in an earlier session.
             case $g in *[:,]*|*[[:cntrl:]]*) die "refusing $p: unsupported character in $(printf '%s' "$g" | sanitize)" ;; esac
             [ ! -L "$g" ] || die "refusing $p: $g is a symlink"
+            id=$(stat -c %i -- "$g") || die "refusing $p: cannot stat $g"
             MOUNT_ARGS+=(-v "$g:/host$g:ro,Z,bind")
+            MOUNT_RISKY+=("$id $g")
             note "mount ro $g (stays read-only)"
         done
     fi
@@ -555,13 +558,19 @@ is_risky_path() {
 #     files) and risky entries (see RISKY_NAMES; a git-aware prompt, direnv or
 #     your host Claude Code acts on them when you work there).
 #   rw mounts: every file changed during the session, by ctime, which the
-#     sandbox cannot backdate; risky ones and symlinks are flagged.
+#     sandbox cannot backdate; risky ones and symlinks are flagged. So is
+#     every risky entry that `sbx up` did not mount read-only, by path and
+#     inode (a recorded entry is a mount point all session, so its path keeps
+#     its inode; btrfs device numbers can change across a reboot): a
+#     directory renamed or moved to a risky name keeps the ctimes of its
+#     files.
 # "defuse" (sbx down, sandbox already stopped) removes symlinks and moves risky
 # entries to state/quarantine with all permissions removed; "report" (sandbox
 # still running and maybe using them) only lists. Never aborts: a failed step
 # is reported.
 scan_outputs() {
-    local mode=$1 f src rel quarantine n=0 hits=() changed=() list=()
+    local mode=$1 f src rel quarantine id recorded=0 n=0 hits=() changed=() list=() ids=()
+    local -A known=()
     if [ "$mode" = defuse ]; then
         # The sandbox writes as your UID; reopen directories it locked with chmod.
         chmod -R u+rwX -- "$LAB_OUT" 2>/dev/null || true
@@ -601,6 +610,12 @@ scan_outputs() {
     done
     # rw mounts of the current session, as recorded by `sbx up`.
     if [ -f "$UP_STAMP" ]; then
+        if [ -f "$UP_RISKY" ] && mapfile -d '' -t ids < "$UP_RISKY"; then
+            recorded=1
+            for f in "${ids[@]}"; do
+                if [ -n "$f" ]; then known[$f]=1; fi
+            done
+        fi
         while IFS= read -r src; do
             find0 list "$src" -xdev -cnewer "$UP_STAMP" ! -type d -print0 \
                 || hits+=("rw mount: COULD NOT read everything in ${src//$'\n'/\\n}; do not use it from the host")
@@ -614,10 +629,14 @@ scan_outputs() {
                 fi
             done
             risky_entries "$src" \
-                || hits+=("rw mount: COULD NOT read everything in ${src//$'\n'/\\n} to find new git repositories")
+                || hits+=("rw mount: COULD NOT read everything in ${src//$'\n'/\\n} to find new risky entries")
+            if [ "$recorded" = 0 ]; then
+                hits+=("rw mount: no record from sbx up of what stayed read-only in ${src//$'\n'/\\n}; every risky entry is listed")
+            fi
             for f in "${RISKY[@]}"; do
-                if [ "$(find "$f/HEAD" -cnewer "$UP_STAMP" 2>/dev/null)" ]; then
-                    hits+=("rw mount: RISKY new git repository: ${f//$'\n'/\\n}")
+                id=$(stat -c %i -- "$f" 2>/dev/null) || id=unknown
+                if [ -z "${known["$id $f"]:-}" ]; then
+                    hits+=("rw mount: RISKY new since sbx up (created, moved or renamed): ${f//$'\n'/\\n}")
                 fi
             done
         done < <(session_rw_mounts)
@@ -694,7 +713,7 @@ stop_all() {
         return 1
     fi
     scan_outputs defuse || true
-    rm -f "$MODE_FILE" "$VM_ARGS"
+    rm -f "$MODE_FILE" "$VM_ARGS" "$UP_RISKY"
     save_egress_log
     podman rm -f -t 5 --ignore "$CTR" "$EGRESS" >/dev/null
     rm -f "$STOPPING"
@@ -726,7 +745,7 @@ write_seccomp_profile() {
 cmd_up() {
     local net=api replace=0 vm=0 spec c m ram
     local specs=() copies=() secret_args=() net_args=() env_args=() box_args=()
-    MOUNT_ARGS=() MOUNT_SPECS=()
+    MOUNT_ARGS=() MOUNT_SPECS=() MOUNT_RISKY=()
     while [ $# -gt 0 ]; do
         case $1 in
             --net)      need_arg "$1" "${2:-}"; net=$2; shift 2 ;;
@@ -764,6 +783,9 @@ cmd_up() {
     for spec in "${specs[@]}"; do add_mount "$spec"; done
 
     mkdir -p "$STATE_HOME" "$LAB_IN" "$LAB_OUT" "$RUNS" "$LOGS"
+    # What stays read-only, recorded before the sandbox starts: scan_outputs
+    # flags every other risky entry in the rw mounts.
+    if [ ${#MOUNT_RISKY[@]} -gt 0 ]; then printf '%s\0' "${MOUNT_RISKY[@]}"; fi > "$UP_RISKY"
     for c in "${copies[@]}"; do copy_in "$c"; done
     write_seccomp_profile
 
@@ -1250,7 +1272,7 @@ cmd_check() {
         # inside those, so a failing command in add_mount could pass here
         # while `sbx up` stops on it.
         set +e
-        (set -e; MOUNT_ARGS=() MOUNT_SPECS=(); add_mount "$spec") 2>&1
+        (set -e; MOUNT_ARGS=() MOUNT_SPECS=() MOUNT_RISKY=(); add_mount "$spec") 2>&1
         one=$?
         set -e
         if [ "$one" -eq 0 ]; then
