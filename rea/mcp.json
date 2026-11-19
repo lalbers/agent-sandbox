@@ -6,7 +6,9 @@
       "env": {
         "GHIDRA_INSTALL_DIR": "/opt/ghidra",
         "JAVA_HOME": "/opt/jdk",
-        "REA_MITMDUMP_COMMAND": "/opt/mitmproxy/bin/mitmdump"
+        "REA_MITMDUMP_COMMAND": "/opt/mitmproxy/bin/mitmdump",
+        "REA_BROWSER_EXECUTABLE": "/usr/bin/chromium-browser",
+        "REA_BROWSER_NO_SANDBOX": "true"
       }
     }
   }
