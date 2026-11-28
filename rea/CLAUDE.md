@@ -19,7 +19,13 @@ chromium-browser --headless=new --no-sandbox --proxy-server="$HTTPS_PROXY" \
 
 The two `--disable-*` flags stop background and component-update traffic, and
 `--no-first-run` only skips the first-run setup. `--no-sandbox` is needed
-because the container has no privileges for Chromium's own sandbox.
+because the container has no privileges for Chromium's own sandbox. For the
+same reason, the rea MCP server runs with `REA_BROWSER_NO_SANDBOX=true`, so
+the Chromium that REA launches itself starts too. Module traces
+(`trace_web_module_imports`) use `REA_BROWSER_EXECUTABLE=/usr/bin/chromium-browser`.
+Browser scenarios with `mode: "launch"` need
+`executable_path: "/usr/bin/chromium-browser"` in the call and accept http(s)
+start URLs only; serve local files from a loopback HTTP server.
 
 ### Runtime analysis
 
