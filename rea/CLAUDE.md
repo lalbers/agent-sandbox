@@ -4,7 +4,7 @@
 The `rea` MCP server is your reverse-engineering toolkit; the CLI is `rea`
 (for example, `rea doctor --json`).
 
-Ghidra 12.1 is at `$GHIDRA_INSTALL_DIR` (`/opt/ghidra`), and JDK 21 is at
+Ghidra 12.2 is at `$GHIDRA_INSTALL_DIR` (`/opt/ghidra`), and JDK 25 is at
 `$JAVA_HOME` (`/opt/jdk`). Hopper and IDA are not installed.
 
 Browser observation only makes sense with `SBX_NET=open`. Start Chromium
@@ -32,7 +32,9 @@ start URLs only; serve local files from a loopback HTTP server.
 Frida (`rea instrument-with-frida`, `rea list-frida-*`) and process capture
 (`rea capture-process`) run the target inside the sandbox (the container, or
 the microVM in vm mode) without extra privileges. Use them only when the
-operator asked for runtime analysis.
+operator asked for runtime analysis. Through MCP, these tools (and
+`inspect_pcap_capture`, `start_rizin_debug_session`, `start_gdb_session`)
+take absolute paths only, such as `/lab/in/...`.
 
 REA uses mitmdump 12.2.3 (`$REA_MITMDUMP_COMMAND`) to decode `.mitm` captures.
 The sandbox has no direct network. For a live capture, run mitmdump yourself

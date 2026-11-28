@@ -1092,7 +1092,7 @@ cmd_token() {
             fi
             tok=${tok//[[:space:]]/}
             [ -n "$tok" ] || die "empty token"
-            [[ $tok == sk-ant-oat01-* ]] || note "warning: this does not look like a setup-token (sk-ant-oat01-...); storing it anyway"
+            [[ $tok == sk-ant-oat[0-9][0-9]-* ]] || note "warning: this does not look like a setup-token (sk-ant-oat01-... or oat02-...); storing it anyway"
             printf '%s' "$tok" | podman secret create --replace "$SECRET" - >/dev/null
             note "token stored as podman secret '$SECRET'"
             if exists "$CTR"; then note "apply it to the running sandbox: sbx restart"; fi

@@ -76,7 +76,7 @@ host (rootless Podman, SELinux enforcing)
 │  │                                                                     │
 │  │  claude-sbx   container, or one libkrun microVM per command (--vm)  │
 │  │   ├ Claude Code (setup-token auth, bypassPermissions)               │
-│  │   ├ REA MCP server, Ghidra 12.1, JDK 21, Chromium, Frida, mitmdump  │
+│  │   ├ REA MCP server, Ghidra 12.2, JDK 25, Chromium, Frida, mitmdump  │
 │  │   └ /lab/in (ro) · /lab/out (rw) · /host/<path> (your mounts)       │
 │  │                   │ HTTP(S)_PROXY                                   │
 │  │  sbx-egress ──────┘ squid ── network sbx-ext ──► internet           │
