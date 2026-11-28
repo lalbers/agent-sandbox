@@ -1,5 +1,5 @@
 # claude-sbx REA image: base + REA (reverse-engineering MCP server) with
-# Ghidra 12.1.x, a JDK 21 and Chromium for browser observation.
+# Ghidra 12.2, a JDK 25 and Chromium for browser observation.
 #
 # REA is only ever installed here, never on the host: npm install scripts,
 # Ghidra and every analysed target run inside the sandbox.
@@ -26,7 +26,7 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         chromium libglvnd-gles mesa-libEGL mesa-dri-drivers \
     && dnf clean all && rm -rf /var/cache/dnf
 
-# Temurin JDK 21, checksum-verified.
+# Temurin JDK 25, checksum-verified.
 RUN set -o pipefail \
     && curl -fsSL -o /tmp/jdk.tar.gz "$JDK_URL" \
     && echo "$JDK_SHA256  /tmp/jdk.tar.gz" | sha256sum -c - \
